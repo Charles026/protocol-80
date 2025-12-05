@@ -4,4 +4,10 @@
 
 export { TypstEditor } from './TypstEditor'
 export { TypstPreview } from './TypstPreview'
+export { 
+  DebugOverlay, 
+  DebugControls,
+  type DebugOverlayProps,
+  type DebugControlsProps,
+} from './DebugOverlay'
 

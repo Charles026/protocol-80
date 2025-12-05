@@ -2,28 +2,32 @@
  * useTypstCompiler - Typst WASM 编译器生命周期管理 Hook
  *
  * 设计原则：
- * 1. 单例模式：编译器实例在整个应用生命周期中只初始化一次
- * 2. 类型安全：严格定义输入输出类型
- * 3. 错误处理：标准化错误信息对象
+ * 1. Worker 模式：编译器运行在 Web Worker 中，主线程零阻塞
+ * 2. IncrementalServer：支持增量编译，提高性能
+ * 3. 类型安全：严格定义输入输出类型
+ * 4. 生命周期管理：正确处理 reset() 防止内存泄漏
+ * 
+ * 架构变更（v2.0）：
+ * - 从直接调用 TypstCompiler 改为通过 TypstWorkerService
+ * - 编译操作不再阻塞主线程
+ * - 字体按需加载，不预加载所有字体
  */
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import {
-  createTypstCompiler,
-  type TypstCompiler,
-  type CompileOptions,
-  CompileFormatEnum,
-} from '@myriaddreamin/typst.ts/compiler'
-import { preloadFontAssets } from '@myriaddreamin/typst.ts/options.init'
+  TypstWorkerService,
+  type CompileResult,
+  type WorkerStatus,
+} from '../services'
 
 // ============================================================================
 // Types
 // ============================================================================
 
 /**
- * 编译器状态枚举
+ * 编译器状态（映射自 WorkerStatus）
  */
-export type CompilerStatus = 
+export type CompilerStatus =
   | 'idle'           // 初始状态
   | 'initializing'   // 正在初始化 WASM
   | 'ready'          // 就绪，可以编译
@@ -56,22 +60,10 @@ export interface CompileError {
 }
 
 /**
- * 编译结果类型
- */
-export interface CompileResult {
-  /** 编译成功时的 artifact 数据 */
-  artifact: Uint8Array | null
-  /** 编译诊断信息 */
-  diagnostics: DiagnosticMessage[]
-  /** 是否存在错误 */
-  hasError: boolean
-}
-
-/**
  * 编译选项
  */
 export interface UseTypstCompileOptions {
-  /** 
+  /**
    * 输出格式
    * @default 'vector'
    */
@@ -91,85 +83,55 @@ export interface UseTypstCompilerReturn {
   status: CompilerStatus
   /** 编译函数 */
   compile: (source: string, options?: UseTypstCompileOptions) => Promise<CompileResult>
+  /** 增量更新编译 */
+  incrementalCompile: (path: string, content: string) => Promise<CompileResult>
   /** 最近一次错误 */
   error: CompileError | null
-  /** 重置编译器状态 */
+  /** 重置编译器状态（用于文档全量重载） */
   reset: () => Promise<void>
   /** 编译器是否就绪 */
   isReady: boolean
 }
 
 // ============================================================================
-// Module-level Singleton
+// Status Mapping
 // ============================================================================
 
 /**
- * 模块级编译器实例（单例）
- * 使用 Promise 确保并发初始化请求只执行一次
+ * 将 WorkerStatus 映射到 CompilerStatus
  */
-let compilerInstance: TypstCompiler | null = null
-let initPromise: Promise<TypstCompiler> | null = null
-
-/**
- * 获取 WASM 模块 URL
- * 在开发环境下，从 node_modules 加载；生产环境下从静态资源加载
- */
-function getWasmModuleUrl(): string {
-  // 使用 import.meta.url 相对路径，让 Vite 正确处理
-  return new URL(
-    '@myriaddreamin/typst-ts-web-compiler/pkg/typst_ts_web_compiler_bg.wasm',
-    import.meta.url
-  ).href
-}
-
-/**
- * 获取或初始化编译器单例
- */
-async function getOrInitCompiler(): Promise<TypstCompiler> {
-  // 如果已有实例，直接返回
-  if (compilerInstance) {
-    return compilerInstance
-  }
-
-  // 如果正在初始化，等待初始化完成
-  if (initPromise) {
-    return initPromise
-  }
-
-  // 开始初始化
-  initPromise = (async () => {
-    const compiler = createTypstCompiler()
-    
-    await compiler.init({
-      beforeBuild: [
-        // 预加载字体：文本、CJK（中日韩）、Emoji
-        preloadFontAssets({ assets: ['text', 'cjk', 'emoji'] }),
-      ],
-      // 显式提供 WASM 模块 URL
-      getModule: () => getWasmModuleUrl(),
-    })
-
-    compilerInstance = compiler
-    return compiler
-  })()
-
-  try {
-    return await initPromise
-  } catch (error) {
-    // 初始化失败，清理状态以允许重试
-    initPromise = null
-    throw error
+function mapWorkerStatus(status: WorkerStatus): CompilerStatus {
+  switch (status) {
+    case 'uninitialized':
+      return 'idle'
+    case 'initializing':
+      return 'initializing'
+    case 'ready':
+      return 'ready'
+    case 'compiling':
+      return 'compiling'
+    case 'disposed':
+    case 'worker_error':
+      return 'error'
+    default:
+      return 'idle'
   }
 }
 
+// ============================================================================
+// External Store for Worker Status
+// ============================================================================
+
 /**
- * 重置编译器单例（用于测试或错误恢复）
+ * 使用 useSyncExternalStore 订阅 Worker 状态
+ * 这确保了状态更新与 React 18 并发特性兼容
  */
-async function resetCompilerSingleton(): Promise<void> {
-  if (compilerInstance) {
-    await compilerInstance.reset()
-    compilerInstance.resetShadow()
-  }
+function subscribeToWorkerStatus(callback: () => void): () => void {
+  return TypstWorkerService.onStatusChange(callback)
+}
+
+function getWorkerStatusSnapshot(): CompilerStatus {
+  return mapWorkerStatus(TypstWorkerService.getStatus())
 }
 
 // ============================================================================
@@ -205,34 +167,30 @@ async function resetCompilerSingleton(): Promise<void> {
  * ```
  */
 export function useTypstCompiler(): UseTypstCompilerReturn {
-  const [status, setStatus] = useState<CompilerStatus>('idle')
   const [error, setError] = useState<CompileError | null>(null)
-  
-  // 使用 ref 跟踪组件挂载状态，避免在卸载后更新状态
+
+  // 使用 useSyncExternalStore 订阅 Worker 状态
+  // 这比手动 useState + useEffect 更高效且并发安全
+  const status = useSyncExternalStore(
+    subscribeToWorkerStatus,
+    getWorkerStatusSnapshot,
+    getWorkerStatusSnapshot // SSR 快照（相同）
+  )
+
+  // 使用 ref 跟踪组件挂载状态
   const isMountedRef = useRef(true)
-  // 使用 ref 存储编译器引用，避免重复获取
-  const compilerRef = useRef<TypstCompiler | null>(null)
 
   // 组件挂载时初始化编译器
   useEffect(() => {
     isMountedRef.current = true
 
     const initCompiler = async () => {
-      if (compilerRef.current) return // 已初始化
-
-      setStatus('initializing')
-      setError(null)
+      if (TypstWorkerService.isReady()) return // 已初始化
 
       try {
-        const compiler = await getOrInitCompiler()
-        
-        if (isMountedRef.current) {
-          compilerRef.current = compiler
-          setStatus('ready')
-        }
+        await TypstWorkerService.init()
       } catch (err) {
         if (isMountedRef.current) {
-          setStatus('error')
           setError({
             type: 'init_error',
             message: `Failed to initialize Typst compiler: ${err instanceof Error ? err.message : String(err)}`,
@@ -254,18 +212,7 @@ export function useTypstCompiler(): UseTypstCompilerReturn {
    */
   const compile = useCallback(
     async (source: string, options?: UseTypstCompileOptions): Promise<CompileResult> => {
-      const compiler = compilerRef.current
-
       // 前置检查
-      if (!compiler) {
-        const err: CompileError = {
-          type: 'init_error',
-          message: 'Compiler not initialized. Please wait for initialization to complete.',
-        }
-        setError(err)
-        return { artifact: null, diagnostics: [], hasError: true }
-      }
-
       if (!source || typeof source !== 'string') {
         const err: CompileError = {
           type: 'source_error',
@@ -275,59 +222,31 @@ export function useTypstCompiler(): UseTypstCompilerReturn {
         return { artifact: null, diagnostics: [], hasError: true }
       }
 
-      const mainFilePath = options?.mainFilePath ?? '/main.typ'
-      const format = options?.format === 'pdf' 
-        ? CompileFormatEnum.pdf 
-        : CompileFormatEnum.vector
-
-      setStatus('compiling')
       setError(null)
 
       try {
-        // 重置之前的 shadow 文件，确保干净的编译环境
-        compiler.resetShadow()
-        
-        // 添加源文件
-        compiler.addSource(mainFilePath, source)
+        const result = await TypstWorkerService.compile(source, {
+          mainFilePath: options?.mainFilePath ?? '/main.typ',
+          format: options?.format ?? 'vector',
+        })
 
-        // 编译选项
-        const compileOptions: CompileOptions<typeof format, 'full'> = {
-          mainFilePath,
-          format,
-          diagnostics: 'full',
-        }
-
-        // 执行编译
-        const result = await compiler.compile(compileOptions)
-
-        if (isMountedRef.current) {
-          setStatus('ready')
-        }
-
-        // 处理编译结果
-        const diagnostics = (result.diagnostics ?? []) as DiagnosticMessage[]
-        const hasError = diagnostics.some(d => d.severity === 'error')
-
-        if (hasError && !result.result) {
-          const err: CompileError = {
+        // 处理编译错误
+        if (result.hasError && isMountedRef.current) {
+          const firstError = result.diagnostics.find(d => d.severity === 'error')
+          setError({
             type: 'compile_error',
-            message: diagnostics.find(d => d.severity === 'error')?.message ?? 'Compilation failed',
-            diagnostics,
-          }
-          if (isMountedRef.current) {
-            setError(err)
-          }
+            message: firstError?.message ?? 'Compilation failed',
+            diagnostics: result.diagnostics as DiagnosticMessage[],
+          })
         }
 
         return {
-          artifact: result.result ?? null,
-          diagnostics,
-          hasError,
+          artifact: result.artifact,
+          diagnostics: result.diagnostics as DiagnosticMessage[],
+          hasError: result.hasError,
         }
       } catch (err) {
         if (isMountedRef.current) {
-          setStatus('ready') // 恢复就绪状态，允许重试
-          
           const compileError: CompileError = {
             type: 'compile_error',
             message: `Compilation failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -347,15 +266,71 @@ export function useTypstCompiler(): UseTypstCompilerReturn {
   )
 
   /**
+   * 增量更新编译
+   * 
+   * 用于编辑器实时预览场景，只更新变化的文件
+   */
+  const incrementalCompile = useCallback(
+    async (path: string, content: string): Promise<CompileResult> => {
+      if (!content || typeof content !== 'string') {
+        const err: CompileError = {
+          type: 'source_error',
+          message: 'Invalid content: content must be a non-empty string.',
+        }
+        setError(err)
+        return { artifact: null, diagnostics: [], hasError: true }
+      }
+
+      setError(null)
+
+      try {
+        const result = await TypstWorkerService.incrementalUpdate(path, content)
+
+        if (result.hasError && isMountedRef.current) {
+          const firstError = result.diagnostics.find(d => d.severity === 'error')
+          setError({
+            type: 'compile_error',
+            message: firstError?.message ?? 'Incremental compilation failed',
+            diagnostics: result.diagnostics as DiagnosticMessage[],
+          })
+        }
+
+        return {
+          artifact: result.artifact,
+          diagnostics: result.diagnostics as DiagnosticMessage[],
+          hasError: result.hasError,
+        }
+      } catch (err) {
+        if (isMountedRef.current) {
+          setError({
+            type: 'compile_error',
+            message: `Incremental compilation failed: ${err instanceof Error ? err.message : String(err)}`,
+            cause: err,
+          })
+        }
+
+        return {
+          artifact: null,
+          diagnostics: [],
+          hasError: true,
+        }
+      }
+    },
+    []
+  )
+
+  /**
    * 重置编译器状态
+   * 
+   * 在文档全量重载时调用：
+   * - 清理内部编译状态
+   * - 防止内存泄漏
+   * - 重置 shadow 文件系统
    */
   const reset = useCallback(async () => {
     try {
-      await resetCompilerSingleton()
+      await TypstWorkerService.reset()
       setError(null)
-      if (isMountedRef.current) {
-        setStatus('ready')
-      }
     } catch (err) {
       if (isMountedRef.current) {
         setError({
@@ -370,6 +345,7 @@ export function useTypstCompiler(): UseTypstCompilerReturn {
   return {
     status,
     compile,
+    incrementalCompile,
     error,
     reset,
     isReady: status === 'ready',
@@ -377,4 +353,3 @@ export function useTypstCompiler(): UseTypstCompilerReturn {
 }
 
 export default useTypstCompiler
-

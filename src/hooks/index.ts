@@ -6,9 +6,17 @@ export {
   useTypstCompiler,
   type CompilerStatus,
   type CompileError,
-  type CompileResult,
   type UseTypstCompileOptions,
   type UseTypstCompilerReturn,
   type DiagnosticMessage,
 } from './useTypstCompiler'
 
+export {
+  useDebugOverlay,
+  extractDebugBoxes,
+  type UseDebugOverlayOptions,
+  type UseDebugOverlayReturn,
+} from './useDebugOverlay'
+
+// Re-export CompileResult from services for backwards compatibility
+export type { CompileResult } from '../services'

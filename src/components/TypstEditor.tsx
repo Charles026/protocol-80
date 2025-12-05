@@ -4,7 +4,7 @@
  * 集成源码编辑器和实时预览，支持防抖编译
  */
 
-import { useState, useEffect, useCallback, Suspense } from 'react'
+import { useState, useEffect, useCallback, useRef, Suspense } from 'react'
 import { useTypstCompiler } from '../hooks'
 import { useDebouncedCallback } from '../utils/useDebounce'
 import { TypstPreview } from './TypstPreview'
@@ -107,24 +107,33 @@ function ErrorDisplay({ message, onDismiss }: ErrorDisplayProps) {
 // ============================================================================
 
 export function TypstEditor() {
-  const { compile, status, error, isReady } = useTypstCompiler()
+  const { compile, incrementalCompile, status, error, isReady, reset } = useTypstCompiler()
   
   const [source, setSource] = useState(DEFAULT_SOURCE)
   const [artifact, setArtifact] = useState<Uint8Array | null>(null)
   const [compileTime, setCompileTime] = useState<number | null>(null)
   const [localError, setLocalError] = useState<string | null>(null)
 
+  // 是否使用增量编译（首次编译后启用）
+  const hasCompiledOnce = useRef(false)
+
   // 执行编译
   const doCompile = useCallback(async (src: string) => {
     if (!isReady || !src.trim()) return
 
     const startTime = performance.now()
-    const result = await compile(src)
+    
+    // 使用增量编译提升性能（首次编译使用完整编译）
+    const result = hasCompiledOnce.current
+      ? await incrementalCompile('/main.typ', src)
+      : await compile(src)
+    
     const endTime = performance.now()
 
     setCompileTime(Math.round(endTime - startTime))
 
     if (result.artifact) {
+      hasCompiledOnce.current = true
       setArtifact(result.artifact)
       setLocalError(null)
     } else if (result.hasError && result.diagnostics.length > 0) {
@@ -132,7 +141,7 @@ export function TypstEditor() {
       const firstError = result.diagnostics.find(d => d.severity === 'error')
       setLocalError(firstError?.message ?? 'Compilation failed')
     }
-  }, [compile, isReady])
+  }, [compile, incrementalCompile, isReady])
 
   // 防抖编译
   const debouncedCompile = useDebouncedCallback(doCompile, DEBOUNCE_DELAY)
@@ -165,6 +174,15 @@ export function TypstEditor() {
   const dismissError = () => {
     setLocalError(null)
   }
+
+  // 重置编译器（用于文档全量重载）
+  // @ts-expect-error - Reserved for future use (document reload functionality)
+  const _handleReset = useCallback(async () => {
+    await reset()
+    hasCompiledOnce.current = false
+    // 重新编译当前源码
+    doCompile(source)
+  }, [reset, source, doCompile])
 
   const displayError = error?.message ?? localError
 
