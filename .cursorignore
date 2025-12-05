@@ -1,0 +1,14 @@
+#.cursorignore
+# Rust build artifacts - HUGE noise
+target/
+**/*.rlib
+
+# Node dependencies
+node_modules/
+
+# WASM artifacts (binary blobs are useless tokens)
+**/*.wasm
+
+# Documentation and large assets
+docs/images/
+dist/

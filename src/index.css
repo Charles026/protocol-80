@@ -1,0 +1,584 @@
+/* ============================================================================
+   CSS Variables & Base Styles
+   ============================================================================ */
+
+:root {
+  /* Colors - Light Mode */
+  --color-bg-primary: #f8fafc;
+  --color-bg-secondary: #ffffff;
+  --color-bg-tertiary: #f1f5f9;
+  --color-border: #e2e8f0;
+  --color-border-focus: #3b82f6;
+  --color-text-primary: #0f172a;
+  --color-text-secondary: #475569;
+  --color-text-muted: #94a3b8;
+  --color-accent: #3b82f6;
+  --color-accent-hover: #2563eb;
+  --color-success: #10b981;
+  --color-warning: #f59e0b;
+  --color-error: #ef4444;
+  
+  /* Typography */
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'SF Mono', 'Consolas', monospace;
+  
+  /* Spacing */
+  --space-xs: 0.25rem;
+  --space-sm: 0.5rem;
+  --space-md: 1rem;
+  --space-lg: 1.5rem;
+  --space-xl: 2rem;
+  
+  /* Border Radius */
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  
+  /* Shadows */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+  
+  /* Transitions */
+  --transition-fast: 150ms ease;
+  --transition-normal: 200ms ease;
+}
+
+/* Dark Mode */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-bg-primary: #0f172a;
+    --color-bg-secondary: #1e293b;
+    --color-bg-tertiary: #334155;
+    --color-border: #334155;
+    --color-border-focus: #60a5fa;
+    --color-text-primary: #f1f5f9;
+    --color-text-secondary: #cbd5e1;
+    --color-text-muted: #64748b;
+  }
+}
+
+/* ============================================================================
+   Reset & Base
+   ============================================================================ */
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  font-size: 16px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  font-family: var(--font-sans);
+  font-size: 0.875rem;
+  line-height: 1.6;
+  color: var(--color-text-primary);
+  background-color: var(--color-bg-primary);
+  min-height: 100vh;
+}
+
+#root {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ============================================================================
+   App Layout
+   ============================================================================ */
+
+.app {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.app-header {
+  flex-shrink: 0;
+  padding: var(--space-md) var(--space-lg);
+  background: var(--color-bg-secondary);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.header-content h1 {
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: var(--color-text-primary);
+  letter-spacing: -0.02em;
+}
+
+.header-content p {
+  font-size: 0.8125rem;
+  color: var(--color-text-muted);
+  margin-top: 2px;
+}
+
+.app-main {
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ============================================================================
+   Loading States
+   ============================================================================ */
+
+.global-loading {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-md);
+  color: var(--color-text-muted);
+}
+
+.loading-spinner {
+  width: 32px;
+  height: 32px;
+  border: 3px solid var(--color-border);
+  border-top-color: var(--color-accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.loading-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-md);
+  background: var(--color-bg-tertiary);
+  color: var(--color-text-secondary);
+  z-index: 10;
+}
+
+/* ============================================================================
+   Typst Editor
+   ============================================================================ */
+
+.typst-editor {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Status Bar */
+.editor-status-bar {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-sm) var(--space-lg);
+  background: var(--color-bg-secondary);
+  border-bottom: 1px solid var(--color-border);
+  font-size: 0.75rem;
+}
+
+.status-left {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--color-text-muted);
+}
+
+.status-dot.status-idle { background: var(--color-text-muted); }
+.status-dot.status-initializing { 
+  background: var(--color-warning); 
+  animation: pulse 1s ease-in-out infinite;
+}
+.status-dot.status-ready { background: var(--color-success); }
+.status-dot.status-compiling { 
+  background: var(--color-accent); 
+  animation: pulse 0.5s ease-in-out infinite;
+}
+.status-dot.status-error { background: var(--color-error); }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+.status-text {
+  color: var(--color-text-secondary);
+  text-transform: capitalize;
+}
+
+.status-right {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+}
+
+.compile-time {
+  color: var(--color-text-muted);
+}
+
+.artifact-size {
+  color: var(--color-success);
+  font-weight: 500;
+}
+
+/* Error Display */
+.error-display {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-sm) var(--space-lg);
+  background: rgba(239, 68, 68, 0.1);
+  border-bottom: 1px solid rgba(239, 68, 68, 0.2);
+}
+
+.error-content {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.error-icon {
+  color: var(--color-error);
+}
+
+.error-message {
+  color: var(--color-error);
+  font-size: 0.8125rem;
+}
+
+.error-dismiss {
+  background: none;
+  border: none;
+  color: var(--color-error);
+  font-size: 1.25rem;
+  cursor: pointer;
+  padding: var(--space-xs);
+  line-height: 1;
+  opacity: 0.7;
+  transition: opacity var(--transition-fast);
+}
+
+.error-dismiss:hover {
+  opacity: 1;
+}
+
+/* Editor Layout */
+.editor-layout {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  background: var(--color-border);
+  overflow: hidden;
+}
+
+@media (max-width: 768px) {
+  .editor-layout {
+    grid-template-columns: 1fr;
+    grid-template-rows: 1fr 1fr;
+  }
+}
+
+/* Editor Panes */
+.editor-pane {
+  display: flex;
+  flex-direction: column;
+  background: var(--color-bg-secondary);
+  overflow: hidden;
+}
+
+.pane-header {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-sm) var(--space-md);
+  background: var(--color-bg-tertiary);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.pane-header h3 {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-text-muted);
+}
+
+.compile-btn {
+  padding: var(--space-xs) var(--space-sm);
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: white;
+  background: var(--color-accent);
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+
+.compile-btn:hover:not(:disabled) {
+  background: var(--color-accent-hover);
+}
+
+.compile-btn:disabled {
+  background: var(--color-text-muted);
+  cursor: not-allowed;
+}
+
+/* Source Pane */
+.source-pane {
+  min-width: 0;
+}
+
+.source-textarea {
+  flex: 1;
+  width: 100%;
+  padding: var(--space-md);
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.7;
+  color: var(--color-text-primary);
+  background: var(--color-bg-secondary);
+  border: none;
+  resize: none;
+  outline: none;
+  tab-size: 2;
+}
+
+.source-textarea::placeholder {
+  color: var(--color-text-muted);
+}
+
+.source-textarea:focus {
+  background: var(--color-bg-secondary);
+}
+
+/* Preview Pane */
+.preview-pane {
+  position: relative;
+  min-width: 0;
+}
+
+.preview-container {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  background: var(--color-bg-tertiary);
+}
+
+.preview-scroll {
+  position: absolute;
+  inset: 0;
+  overflow: auto;
+  padding: var(--space-lg);
+  display: flex;
+  justify-content: center;
+}
+
+.preview-scroll > div {
+  box-shadow: var(--shadow-lg);
+  border-radius: var(--radius-sm);
+}
+
+/* Typst Document Wrapper - Fix height: 0 issue */
+.typst-wrapper {
+  background: #ffffff;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+/* Override inline style height: 0 */
+.typst-wrapper > div > div[style*="height: 0"],
+.typst-wrapper > div > div[style*="height:0"],
+.typst-wrapper .typst-app,
+div[class*="typst-app"] {
+  height: auto !important;
+  min-height: auto !important;
+}
+
+/* Ensure SVG content is visible */
+.typst-wrapper svg {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+/* Typst renderer styles */
+.typst-html-semantics {
+  position: absolute;
+  z-index: 2;
+  color: transparent;
+  font-family: monospace;
+  white-space: pre;
+}
+
+.typst-html-semantics span {
+  color: transparent;
+  font-family: monospace;
+  transform-origin: left top;
+  position: absolute;
+  display: inline-block;
+  left: 0;
+  top: 0;
+}
+
+.typst-content-hint {
+  position: absolute;
+  display: inline-block;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+}
+
+.typst-html-semantics a {
+  position: absolute;
+  display: inline-block;
+}
+
+.typst-content-group {
+  pointer-events: visible;
+}
+
+.typst-html-semantics span::selection {
+  color: transparent;
+  background: #7db9dea0;
+}
+
+.typst-content-fallback {
+  color: transparent;
+  background: transparent;
+}
+
+.pseudo-link,
+.typst-text {
+  pointer-events: none;
+}
+
+/* TypstPreview Component Styles */
+.typst-preview-container {
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-lg);
+  overflow: visible;
+  position: relative;
+  min-width: 100px;
+}
+
+.typst-render-target {
+  display: block;
+}
+
+/* Ensure all SVG children are visible */
+.typst-render-target svg,
+.typst-render-target canvas,
+.typst-render-target > div {
+  display: block;
+  max-width: 100%;
+}
+
+.typst-preview-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.9);
+  color: var(--color-text-muted);
+}
+
+.typst-preview-error {
+  padding: var(--space-lg);
+  background: rgba(239, 68, 68, 0.1);
+  border-radius: var(--radius-sm);
+  color: var(--color-error);
+  text-align: center;
+}
+
+.preview-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-text-muted);
+}
+
+/* ============================================================================
+   Responsive Adjustments
+   ============================================================================ */
+
+@media (max-width: 640px) {
+  .app-header {
+    padding: var(--space-sm) var(--space-md);
+  }
+  
+  .header-content h1 {
+    font-size: 1rem;
+  }
+  
+  .editor-status-bar {
+    padding: var(--space-xs) var(--space-md);
+  }
+  
+  .status-right {
+    gap: var(--space-sm);
+  }
+  
+  .source-textarea {
+    font-size: 0.75rem;
+    padding: var(--space-sm);
+  }
+  
+  .preview-scroll {
+    padding: var(--space-md);
+  }
+}
+
+/* ============================================================================
+   Scrollbar Styling
+   ============================================================================ */
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-muted);
+}
+
+/* Firefox */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-border) transparent;
+}
