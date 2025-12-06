@@ -189,6 +189,27 @@ export interface DiagnosticInfo {
     readonly package?: string
 }
 
+/** Alias for backward compatibility */
+export type DiagnosticMessage = DiagnosticInfo
+
+/**
+ * Worker health metrics for monitoring
+ */
+export interface WorkerHealthMetrics {
+    /** Memory usage in bytes */
+    readonly memoryUsage: number
+    /** Worker uptime in ms */
+    readonly uptime: number
+    /** Total compilation count */
+    readonly compileCount: number
+    /** Average compile time in ms */
+    readonly averageCompileTime: number
+    /** Last artifact size in bytes */
+    readonly lastArtifactSize: number
+    /** Estimated page count */
+    readonly estimatedPages: number
+}
+
 /**
  * Compile result returned by the Supervisor hook
  */

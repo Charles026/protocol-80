@@ -233,6 +233,73 @@ class TypstWorkerServiceImpl {
   private handleWorkerMessage = (event: MessageEvent<WorkerToMainMessage>): void => {
     const message = event.data
 
+    // Handle bridge protocol messages (kind discriminator) - new worker format
+    if ('kind' in message) {
+      const bridgeMsg = message as unknown as Record<string, unknown>
+      switch (bridgeMsg.kind) {
+        case 'READY':
+          this.workerReady = true
+          this.restartAttempts = 0
+          this.status = 'ready'
+          this.notifyStatusChange({ status: 'ready' })
+          this.workerReadyResolve?.()
+          // Also resolve any pending init request
+          for (const [id] of this.pendingRequests) {
+            if (!id.includes('compile')) {
+              this.resolvePendingRequest(id, undefined)
+            }
+          }
+          return
+
+        case 'COMPILE_SUCCESS': {
+          const requestId = bridgeMsg.requestId as string
+          const artifact = bridgeMsg.artifact as Uint8Array
+          const diagnostics = (bridgeMsg.diagnostics ?? []) as DiagnosticMessage[]
+          this.status = 'ready'
+          this.closeCircuit()
+          this.resolvePendingRequest<CompileResult>(requestId, {
+            artifact,
+            diagnostics,
+            hasError: false,
+          })
+          return
+        }
+
+        case 'COMPILE_ERROR': {
+          const requestId = bridgeMsg.requestId as string
+          const diagnostics = (bridgeMsg.diagnostics ?? []) as DiagnosticMessage[]
+          this.status = 'ready'
+          this.resolvePendingRequest<CompileResult>(requestId, {
+            artifact: null,
+            diagnostics,
+            hasError: true,
+          })
+          return
+        }
+
+        case 'PANIC': {
+          const reason = bridgeMsg.reason as string
+          console.error('[TypstWorkerService] Worker PANIC:', reason)
+          this.recordCircuitFailure()
+          // Reject all pending requests
+          for (const [, request] of this.pendingRequests) {
+            request.reject(new Error(`Worker panicked: ${reason}`))
+            if (request.timeout) clearTimeout(request.timeout)
+          }
+          this.pendingRequests.clear()
+          if (!this.isCircuitOpen()) {
+            this.attemptRestart()
+          }
+          return
+        }
+
+        case 'HEARTBEAT_ACK':
+          // Handled by useResilientWorker, ignore here
+          return
+      }
+    }
+
+    // Legacy protocol fallback (type discriminator)
     switch (message.type) {
       case 'ready':
         this.workerReady = true
@@ -821,7 +888,33 @@ class TypstWorkerServiceImpl {
     this.status = 'initializing'
     this.notifyStatusChange({ status: 'initializing' })
 
-    await this.sendRequest<void>({ type: 'init' })
+    // Recreate worker if disposed or null
+    if (!this.worker) {
+      console.log('[TypstWorkerService] Recreating worker (was disposed)')
+      this.createWorker()
+    }
+
+    // Send init message (worker accepts both type:'init' and kind:'INIT')
+    this.worker!.postMessage({ type: 'init' })
+
+    // Wait for READY response via status change
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error('Init timeout after 30s'))
+      }, 30000)
+
+      const unsubscribe = this.onStatusChange((event) => {
+        if (event.status === 'ready') {
+          clearTimeout(timeout)
+          unsubscribe()
+          resolve()
+        } else if (event.status === 'worker_error') {
+          clearTimeout(timeout)
+          unsubscribe()
+          reject(new Error(event.error ?? 'Init failed'))
+        }
+      })
+    })
   }
 
   /**

@@ -169,63 +169,6 @@ export function useResilientWorker(): UseResilientWorkerReturn {
                     break
             }
         }
-
-        // Also handle legacy protocol for backward compatibility
-        if ('type' in message) {
-            const legacyMsg = message as {
-                type: string
-                id?: string
-                payload?: {
-                    artifact?: Uint8Array
-                    diagnostics?: Array<{ severity: string; message: string }>
-                    error?: string
-                }
-            }
-
-            if (legacyMsg.type === 'ready' || legacyMsg.type === 'init_success') {
-                if (isMountedRef.current && (state === 'BOOTING' || state === 'RECOVERING')) {
-                    setState('IDLE')
-                    restartAttemptsRef.current = 0
-                    setError(null)
-                }
-            } else if (legacyMsg.type === 'compile_success' && legacyMsg.id) {
-                const pending = pendingRequestsRef.current.get(legacyMsg.id)
-                if (pending) {
-                    clearTimeout(pending.timeout)
-                    pendingRequestsRef.current.delete(legacyMsg.id)
-                    pending.resolve({
-                        artifact: legacyMsg.payload?.artifact ?? null,
-                        timing: 0, // Legacy protocol doesn't include timing
-                        hasError: false,
-                        diagnostics: (legacyMsg.payload?.diagnostics ?? []).map(d => ({
-                            severity: d.severity as 'error' | 'warning' | 'info' | 'hint',
-                            message: d.message,
-                        })),
-                    })
-                }
-                if (isMountedRef.current) {
-                    setState('IDLE')
-                }
-            } else if (legacyMsg.type === 'compile_error' && legacyMsg.id) {
-                const pending = pendingRequestsRef.current.get(legacyMsg.id)
-                if (pending) {
-                    clearTimeout(pending.timeout)
-                    pendingRequestsRef.current.delete(legacyMsg.id)
-                    pending.resolve({
-                        artifact: null,
-                        timing: 0,
-                        hasError: true,
-                        diagnostics: (legacyMsg.payload?.diagnostics ?? []).map(d => ({
-                            severity: d.severity as 'error' | 'warning' | 'info' | 'hint',
-                            message: d.message,
-                        })),
-                    })
-                }
-                if (isMountedRef.current) {
-                    setState('IDLE')
-                }
-            }
-        }
     }, [state])
 
     // ============================================================================

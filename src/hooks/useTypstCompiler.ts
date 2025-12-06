@@ -202,12 +202,12 @@ export function useTypstCompiler(): UseTypstCompilerReturn {
 
     initCompiler()
 
-    // Cleanup: Dispose worker to prevent zombie workers on unmount/HMR
+    // Cleanup on unmount
     return () => {
       active = false
-      // Note: Disposing singleton worker - affects all consumers
-      // In multi-consumer scenarios, consider reference counting
-      TypstWorkerService.dispose()
+      // NOTE: Do NOT dispose singleton worker here
+      // Worker lifetime is managed by the service, not by individual consumers
+      // Disposing here causes "Worker not available" on re-mount (React Strict Mode/HMR)
     }
   }, [])
 
