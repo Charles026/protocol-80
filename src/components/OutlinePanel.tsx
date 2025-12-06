@@ -10,7 +10,7 @@
 
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { TypstWorkerService, type OutlineHeadingNode } from '../services/TypstWorkerService'
-import type { OutlineData, OutlineHeading, OutlineFigure } from '../workers/types'
+import type { OutlineData, OutlineHeading, OutlineFigure } from '../types/bridge.d'
 
 // ============================================================================
 // Types

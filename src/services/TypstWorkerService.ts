@@ -5,23 +5,28 @@
  * 1. 单例模式：整个应用共享一个 Worker 实例
  * 2. Promise 化 API：所有 Worker 通信转换为 Promise
  * 3. 错误恢复：Worker 崩溃时自动重启
- * 4. 类型安全：严格的消息类型检查
+ * 4. 类型安全：严格的消息类型检查（统一协议 v2.0）
  * 5. 健康监控：内存使用监控和软重启机制
  */
 
 import type {
   WorkerToMainMessage,
-  DiagnosticMessage,
+  DiagnosticInfo,
+  OutlineData,
+  OutlineHeading,
+  MainToWorkerMessage,
+} from '../types/bridge.d'
+import { assertNever, sendToWorker } from '../types/bridge.d'
+import type {
   PendingRequest,
   CompilerState,
   IntrospectionData,
   SourceMarker,
-  OutlineData,
-  OutlineHeading,
-  WorkerHealthMetrics,
 } from '../workers/types'
-import { FontService } from './FontService'
 import { WorkerHealthMonitor, type HealthStatus, type HealthStatusEvent } from './WorkerHealthMonitor'
+
+/** Alias for backward compatibility */
+type DiagnosticMessage = DiagnosticInfo
 
 // ============================================================================
 // Types
@@ -228,173 +233,82 @@ class TypstWorkerServiceImpl {
   }
 
   /**
-   * 处理 Worker 消息
+   * 处理 Worker 消息（统一协议 v2.0）
+   * 
+   * Uses strict switch with exhaustiveness checking via assertNever
    */
   private handleWorkerMessage = (event: MessageEvent<WorkerToMainMessage>): void => {
     const message = event.data
 
-    // Handle bridge protocol messages (kind discriminator) - new worker format
-    if ('kind' in message) {
-      const bridgeMsg = message as unknown as Record<string, unknown>
-      switch (bridgeMsg.kind) {
-        case 'READY':
-          this.workerReady = true
-          this.restartAttempts = 0
-          this.status = 'ready'
-          this.notifyStatusChange({ status: 'ready' })
-          this.workerReadyResolve?.()
-          // Also resolve any pending init request
-          for (const [id] of this.pendingRequests) {
-            if (!id.includes('compile')) {
-              this.resolvePendingRequest(id, undefined)
-            }
-          }
-          return
-
-        case 'COMPILE_SUCCESS': {
-          const requestId = bridgeMsg.requestId as string
-          const artifact = bridgeMsg.artifact as Uint8Array
-          const diagnostics = (bridgeMsg.diagnostics ?? []) as DiagnosticMessage[]
-          this.status = 'ready'
-          this.closeCircuit()
-          this.resolvePendingRequest<CompileResult>(requestId, {
-            artifact,
-            diagnostics,
-            hasError: false,
-          })
-          return
-        }
-
-        case 'COMPILE_ERROR': {
-          const requestId = bridgeMsg.requestId as string
-          const diagnostics = (bridgeMsg.diagnostics ?? []) as DiagnosticMessage[]
-          this.status = 'ready'
-          this.resolvePendingRequest<CompileResult>(requestId, {
-            artifact: null,
-            diagnostics,
-            hasError: true,
-          })
-          return
-        }
-
-        case 'PANIC': {
-          const reason = bridgeMsg.reason as string
-          console.error('[TypstWorkerService] Worker PANIC:', reason)
-          this.recordCircuitFailure()
-          // Reject all pending requests
-          for (const [, request] of this.pendingRequests) {
-            request.reject(new Error(`Worker panicked: ${reason}`))
-            if (request.timeout) clearTimeout(request.timeout)
-          }
-          this.pendingRequests.clear()
-          if (!this.isCircuitOpen()) {
-            this.attemptRestart()
-          }
-          return
-        }
-
-        case 'HEARTBEAT_ACK':
-          // Handled by useResilientWorker, ignore here
-          return
-      }
-    }
-
-    // Legacy protocol fallback (type discriminator)
-    switch (message.type) {
-      case 'ready':
+    // Unified protocol: all messages use 'kind' discriminator
+    switch (message.kind) {
+      case 'READY':
         this.workerReady = true
         this.restartAttempts = 0
-        this.workerReadyResolve?.()
-        break
-
-      case 'init_success':
         this.status = 'ready'
         this.notifyStatusChange({ status: 'ready' })
-        this.resolvePendingRequest(message.id, undefined)
-        break
+        this.workerReadyResolve?.()
+        // Resolve any pending init requests
+        for (const [id] of this.pendingRequests) {
+          if (!id.includes('compile')) {
+            this.resolvePendingRequest(id, undefined)
+          }
+        }
+        return
 
-      case 'init_error':
-        this.status = 'uninitialized'
-        this.notifyStatusChange({ status: 'uninitialized', error: message.error })
-        this.rejectPendingRequest(message.id, new Error(message.error))
-        break
-
-      case 'compile_success':
+      case 'COMPILE_SUCCESS': {
         this.status = 'ready'
-        // Close circuit breaker on success (recover from HALF_OPEN)
         this.closeCircuit()
-        this.resolvePendingRequest<CompileResult>(message.id, {
-          artifact: message.payload.artifact,
-          diagnostics: message.payload.diagnostics,
+        this.resolvePendingRequest<CompileResult>(message.requestId, {
+          artifact: message.artifact,
+          diagnostics: (message.diagnostics ?? []) as DiagnosticMessage[],
           hasError: false,
         })
-        break
+        return
+      }
 
-      case 'compile_error':
+      case 'COMPILE_ERROR': {
         this.status = 'ready'
-        this.resolvePendingRequest<CompileResult>(message.id, {
+        this.resolvePendingRequest<CompileResult>(message.requestId, {
           artifact: null,
-          diagnostics: message.payload.diagnostics,
+          diagnostics: (message.diagnostics ?? []) as DiagnosticMessage[],
           hasError: true,
         })
-        break
-
-      case 'reset_success':
-        this.status = 'ready'
-        this.resolvePendingRequest(message.id, undefined)
-        break
-
-      case 'font_request':
-        // Worker 请求加载字体
-        this.handleFontRequest(message.id, message.payload.family)
-        break
-
-      case 'introspection_result':
-        // Worker 主动推送的内省数据
-        this.handleIntrospectionResult(message.payload)
-        break
-
-      case 'outline_result':
-        // Worker 主动推送的大纲数据
-        this.handleOutlineResult(message.payload)
-        break
-
-      case 'health_metrics':
-        // Worker 上报的健康指标
-        this.handleHealthMetrics(message.payload)
-        break
-    }
-  }
-
-  /**
-   * 处理 Worker 上报的健康指标
-   */
-  private handleHealthMetrics(metrics: WorkerHealthMetrics): void {
-    // 将指标传递给健康监控器
-    WorkerHealthMonitor.recordCompilation({
-      compileTime: metrics.compileTime,
-      artifactSize: metrics.artifactSize,
-      estimatedPages: metrics.estimatedPages,
-      hasError: metrics.hasError,
-      hasPanic: metrics.hasPanic,
-    })
-  }
-
-  /**
-   * 处理内省数据
-   * Worker 在编译成功后主动推送，无需等待请求
-   */
-  private handleIntrospectionResult(data: IntrospectionData): void {
-    // 缓存最新数据
-    this.latestIntrospection = data
-
-    // 通知所有监听器
-    for (const listener of this.introspectionListeners) {
-      try {
-        listener(data)
-      } catch (error) {
-        console.error('[TypstWorkerService] Introspection listener error:', error)
+        return
       }
+
+      case 'PANIC': {
+        console.error('[TypstWorkerService] Worker PANIC:', message.reason)
+        this.recordCircuitFailure()
+        // Reject all pending requests
+        for (const [, request] of this.pendingRequests) {
+          request.reject(new Error(`Worker panicked: ${message.reason}`))
+          if (request.timeout) clearTimeout(request.timeout)
+        }
+        this.pendingRequests.clear()
+        if (!this.isCircuitOpen()) {
+          this.attemptRestart()
+        }
+        return
+      }
+
+      case 'HEARTBEAT_ACK':
+        // Handled by useResilientWorker heartbeat monitor
+        return
+
+      case 'RESET_SUCCESS':
+        this.status = 'ready'
+        this.resolvePendingRequest(message.requestId, undefined)
+        return
+
+      case 'OUTLINE_RESULT':
+        // Worker 主动推送的大纲数据（新协议）
+        this.handleOutlineResult(message.payload)
+        return
+
+      default:
+        // Exhaustiveness check - TypeScript will error if we miss a case
+        assertNever(message, `[TypstWorkerService] Unknown message kind: ${(message as { kind: string }).kind}`)
     }
   }
 
@@ -746,16 +660,13 @@ class TypstWorkerServiceImpl {
   }
 
   /**
-   * 发送请求并等待响应
-   * 
-   * @param message - 消息对象（不含 id，将自动生成）
-   * @param timeout - 超时时间（毫秒）
+   * Send a compile request using unified protocol
    */
-  private async sendRequest<T>(
-    message: Record<string, unknown>,
+  private async sendCompileRequest(
+    requestId: string,
+    message: MainToWorkerMessage & { kind: 'COMPILE' },
     timeout = REQUEST_TIMEOUT
-  ): Promise<T> {
-    // 等待 Worker 就绪
+  ): Promise<CompileResult> {
     if (!this.workerReady) {
       await this.workerReadyPromise
     }
@@ -764,23 +675,50 @@ class TypstWorkerServiceImpl {
       throw new Error('Worker not available')
     }
 
-    const id = this.generateRequestId()
-    const fullMessage = { ...message, id }
-
     return new Promise((resolve, reject) => {
-      // 设置超时
       const timeoutId = setTimeout(() => {
-        this.pendingRequests.delete(id)
-        reject(new Error(`Request timeout after ${timeout}ms`))
+        this.pendingRequests.delete(requestId)
+        reject(new Error(`Compile timeout after ${timeout}ms`))
       }, timeout)
 
-      this.pendingRequests.set(id, {
+      this.pendingRequests.set(requestId, {
         resolve: resolve as (value: unknown) => void,
         reject,
         timeout: timeoutId,
       })
 
-      this.worker!.postMessage(fullMessage)
+      sendToWorker(this.worker!, message)
+    })
+  }
+
+  /**
+   * Send a reset request using unified protocol
+   */
+  private async sendResetRequest(
+    requestId: string,
+    timeout = REQUEST_TIMEOUT
+  ): Promise<void> {
+    if (!this.workerReady) {
+      await this.workerReadyPromise
+    }
+
+    if (!this.worker) {
+      throw new Error('Worker not available')
+    }
+
+    return new Promise((resolve, reject) => {
+      const timeoutId = setTimeout(() => {
+        this.pendingRequests.delete(requestId)
+        reject(new Error(`Reset timeout after ${timeout}ms`))
+      }, timeout)
+
+      this.pendingRequests.set(requestId, {
+        resolve: resolve as (value: unknown) => void,
+        reject,
+        timeout: timeoutId,
+      })
+
+      sendToWorker(this.worker!, { kind: 'RESET', requestId })
     })
   }
 
@@ -793,51 +731,6 @@ class TypstWorkerServiceImpl {
       if (request.timeout) clearTimeout(request.timeout)
       this.pendingRequests.delete(id)
       request.resolve(value)
-    }
-  }
-
-  /**
-   * 拒绝待处理的请求
-   */
-  private rejectPendingRequest(id: string, error: Error): void {
-    const request = this.pendingRequests.get(id)
-    if (request) {
-      if (request.timeout) clearTimeout(request.timeout)
-      this.pendingRequests.delete(id)
-      request.reject(error)
-    }
-  }
-
-  // --------------------------------------------------------------------------
-  // Font Loading
-  // --------------------------------------------------------------------------
-
-  /**
-   * 处理 Worker 的字体请求
-   */
-  private async handleFontRequest(requestId: string, family: string): Promise<void> {
-    try {
-      const result = await FontService.loadFont(family)
-
-      this.worker?.postMessage({
-        type: 'add_font',
-        id: requestId,
-        payload: {
-          family,
-          buffer: result.buffer,
-          error: result.error,
-        },
-      })
-    } catch (error) {
-      this.worker?.postMessage({
-        type: 'add_font',
-        id: requestId,
-        payload: {
-          family,
-          buffer: null,
-          error: error instanceof Error ? error.message : String(error),
-        },
-      })
     }
   }
 
@@ -894,8 +787,8 @@ class TypstWorkerServiceImpl {
       this.createWorker()
     }
 
-    // Send init message (worker accepts both type:'init' and kind:'INIT')
-    this.worker!.postMessage({ type: 'init' })
+    // Send init message using unified protocol
+    sendToWorker(this.worker!, { kind: 'INIT' })
 
     // Wait for READY response via status change
     return new Promise((resolve, reject) => {
@@ -930,13 +823,14 @@ class TypstWorkerServiceImpl {
     this.notifyStatusChange({ status: 'compiling' })
 
     try {
-      const result = await this.sendRequest<CompileResult>({
-        type: 'compile',
-        payload: {
-          source,
-          mainFilePath: options?.mainFilePath ?? '/main.typ',
-          format: options?.format ?? 'vector',
-        },
+      const requestId = this.generateRequestId()
+      
+      const result = await this.sendCompileRequest(requestId, {
+        kind: 'COMPILE',
+        source,
+        requestId,
+        mainFilePath: options?.mainFilePath ?? '/main.typ',
+        format: options?.format ?? 'vector',
       })
 
       return result
@@ -948,6 +842,9 @@ class TypstWorkerServiceImpl {
 
   /**
    * 增量更新并编译
+   * 
+   * Note: In v2.0 protocol, incremental updates are handled via COMPILE
+   * with the source being the updated content
    */
   async incrementalUpdate(path: string, content: string): Promise<CompileResult> {
     if (this.status !== 'ready' && this.status !== 'compiling') {
@@ -958,9 +855,15 @@ class TypstWorkerServiceImpl {
     this.notifyStatusChange({ status: 'compiling' })
 
     try {
-      return await this.sendRequest<CompileResult>({
-        type: 'incremental_update',
-        payload: { path, content },
+      const requestId = this.generateRequestId()
+      
+      // Use COMPILE message for incremental updates
+      return await this.sendCompileRequest(requestId, {
+        kind: 'COMPILE',
+        source: content,
+        requestId,
+        mainFilePath: path,
+        format: 'vector',
       })
     } finally {
       this.status = 'ready'
@@ -978,7 +881,8 @@ class TypstWorkerServiceImpl {
       return
     }
 
-    await this.sendRequest<void>({ type: 'reset' })
+    const requestId = this.generateRequestId()
+    await this.sendResetRequest(requestId)
   }
 
   /**
@@ -986,8 +890,8 @@ class TypstWorkerServiceImpl {
    */
   dispose(): void {
     if (this.worker) {
-      // 发送销毁消息
-      this.worker.postMessage({ type: 'dispose', id: 'dispose' })
+      // 发送销毁消息 using unified protocol
+      sendToWorker(this.worker, { kind: 'DISPOSE' })
 
       // 移除事件监听
       this.worker.removeEventListener('message', this.handleWorkerMessage)
@@ -1221,7 +1125,7 @@ export interface OutlineHeadingNode extends OutlineHeading {
 /**
  * 将平面标题列表转换为树结构
  */
-function buildHeadingTree(headings: OutlineHeading[]): OutlineHeadingNode[] {
+function buildHeadingTree(headings: readonly OutlineHeading[]): OutlineHeadingNode[] {
   const root: OutlineHeadingNode[] = []
   const stack: OutlineHeadingNode[] = []
 

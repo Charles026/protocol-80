@@ -223,7 +223,7 @@ export function useTypstCompiler(): UseTypstCompilerReturn {
           message: 'Invalid source: source must be a non-empty string.',
         }
         setError(err)
-        return { artifact: null, diagnostics: [], hasError: true }
+        return { artifact: null, diagnostics: [], hasError: true, timing: 0 }
       }
 
       setError(null)
@@ -248,6 +248,7 @@ export function useTypstCompiler(): UseTypstCompilerReturn {
           artifact: result.artifact,
           diagnostics: result.diagnostics as DiagnosticMessage[],
           hasError: result.hasError,
+          timing: 0, // Timing is managed by worker, not surfaced here
         }
       } catch (err) {
         if (isMountedRef.current) {
@@ -263,6 +264,7 @@ export function useTypstCompiler(): UseTypstCompilerReturn {
           artifact: null,
           diagnostics: [],
           hasError: true,
+          timing: 0,
         }
       }
     },
@@ -282,7 +284,7 @@ export function useTypstCompiler(): UseTypstCompilerReturn {
           message: 'Invalid content: content must be a non-empty string.',
         }
         setError(err)
-        return { artifact: null, diagnostics: [], hasError: true }
+        return { artifact: null, diagnostics: [], hasError: true, timing: 0 }
       }
 
       setError(null)
@@ -303,6 +305,7 @@ export function useTypstCompiler(): UseTypstCompilerReturn {
           artifact: result.artifact,
           diagnostics: result.diagnostics as DiagnosticMessage[],
           hasError: result.hasError,
+          timing: 0, // Timing is managed by worker, not surfaced here
         }
       } catch (err) {
         if (isMountedRef.current) {
@@ -317,6 +320,7 @@ export function useTypstCompiler(): UseTypstCompilerReturn {
           artifact: null,
           diagnostics: [],
           hasError: true,
+          timing: 0,
         }
       }
     },

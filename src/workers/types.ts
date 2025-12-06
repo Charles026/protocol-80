@@ -1,9 +1,63 @@
 /**
- * Typst Worker Message Protocol
+ * Typst Worker Types
  * 
- * 定义主线程与 Worker 之间的通信协议
- * 遵循严格的类型安全原则
+ * This file contains domain-specific types used by the Worker.
+ * 
+ * IMPORTANT: All message protocol types are defined in '../types/bridge.d.ts'
+ * This file re-exports them for convenience and adds Worker-specific utility types.
+ * 
+ * @module workers/types
  */
+
+// ============================================================================
+// Re-export Protocol Types from Single Source of Truth
+// ============================================================================
+
+export type {
+  // FSM States
+  WorkerState,
+  
+  // Inbound Messages
+  MainToWorkerMessage,
+  InitMessage,
+  CompileMessage,
+  HeartbeatMessage,
+  ResetMessage,
+  DisposeMessage,
+  
+  // Outbound Messages
+  WorkerToMainMessage,
+  ReadyMessage,
+  CompileSuccessMessage,
+  CompileErrorMessage,
+  PanicMessage,
+  HeartbeatAckMessage,
+  ResetSuccessMessage,
+  OutlineResultMessage,
+  
+  // Supporting Types
+  DiagnosticInfo,
+  DiagnosticMessage,
+  WorkerHealthMetrics,
+  CompileResult,
+  
+  // Outline Types
+  OutlineHeading,
+  OutlineFigure,
+  OutlineData,
+} from '../types/bridge.d'
+
+// Re-export utility functions
+export {
+  assertNever,
+  isCompileSuccess,
+  isPanic,
+  isHeartbeatAck,
+  isOutlineResult,
+  sendToWorker,
+  postWorkerResponse,
+  WorkerCrashedError,
+} from '../types/bridge.d'
 
 // ============================================================================
 // Coordinate and Location Types
@@ -126,66 +180,6 @@ export const DEBUG_BOX_BORDER_COLORS: Record<DebugBoxType, string> = {
 }
 
 // ============================================================================
-// Outline / Semantic Extraction Types
-// ============================================================================
-
-/**
- * 文档标题项
- * 由 Typst query(heading) 生成
- */
-export interface OutlineHeading {
-  /** 标题级别 (1-6) */
-  level: number
-  /** 标题文本内容 */
-  body: string
-  /** 所在页码 */
-  page: number
-  /** Y 坐标（pt），用于页面内定位 */
-  y: number
-}
-
-/**
- * 文档图表项
- * 由 Typst query(figure) 生成
- */
-export interface OutlineFigure {
-  /** 图表类型 (image, table, raw 等) */
-  kind: string
-  /** 图表标题/描述 */
-  caption: string
-  /** 图表编号 */
-  number: number
-  /** 所在页码 */
-  page: number
-  /** Y 坐标（pt），用于页面内定位 */
-  y: number
-}
-
-/**
- * 文档大纲数据
- * 包含标题、图表等结构化信息
- */
-export interface OutlineData {
-  /** 所有标题 */
-  headings: OutlineHeading[]
-  /** 所有图表 */
-  figures: OutlineFigure[]
-  /** 文档总页数 */
-  pageCount: number
-}
-
-/**
- * 大纲数据响应 - 编译成功后主动推送
- */
-export interface OutlineResponse {
-  type: 'outline_result'
-  /** 关联的编译请求 ID */
-  id: string
-  /** 大纲数据 */
-  payload: OutlineData
-}
-
-// ============================================================================
 // Font Loading Types
 // ============================================================================
 
@@ -208,229 +202,36 @@ export interface FontResponse {
 }
 
 // ============================================================================
-// Worker Messages (Main Thread → Worker)
+// Typst Query Result Types (for type-safe query handling)
 // ============================================================================
 
 /**
- * 初始化编译器
+ * Typst heading query result (raw from compiler)
  */
-export interface InitMessage {
-  type: 'init'
-  id: string
-}
-
-/**
- * 编译文档
- */
-export interface CompileMessage {
-  type: 'compile'
-  id: string
-  payload: {
-    source: string
-    mainFilePath: string
-    format: 'vector' | 'pdf'
+export interface TypstHeadingQueryResult {
+  level?: number
+  body?: unknown
+  location?: {
+    page?: number
+    position?: { x?: number; y?: number }
   }
 }
 
 /**
- * 增量更新文档
+ * Typst figure query result (raw from compiler)
  */
-export interface IncrementalUpdateMessage {
-  type: 'incremental_update'
-  id: string
-  payload: {
-    path: string
-    content: string
+export interface TypstFigureQueryResult {
+  kind?: string
+  caption?: { body?: unknown }
+  location?: {
+    page?: number
+    position?: { x?: number; y?: number }
   }
 }
 
-/**
- * 重置编译器状态
- */
-export interface ResetMessage {
-  type: 'reset'
-  id: string
-}
-
-/**
- * 完全销毁编译器（释放 WASM 内存）
- */
-export interface DisposeMessage {
-  type: 'dispose'
-  id: string
-}
-
-/**
- * 添加字体数据（响应字体请求）
- */
-export interface AddFontMessage {
-  type: 'add_font'
-  id: string
-  payload: FontResponse
-}
-
-/**
- * 所有可能的主线程消息类型
- */
-export type MainToWorkerMessage =
-  | InitMessage
-  | CompileMessage
-  | IncrementalUpdateMessage
-  | ResetMessage
-  | DisposeMessage
-  | AddFontMessage
-
 // ============================================================================
-// Worker Responses (Worker → Main Thread)
+// Compiler State (for TypstWorkerService)
 // ============================================================================
-
-/**
- * 诊断消息
- */
-export interface DiagnosticMessage {
-  package: string
-  path: string
-  severity: 'error' | 'warning' | 'info' | 'hint'
-  range: string
-  message: string
-}
-
-/**
- * 初始化成功响应
- */
-export interface InitSuccessResponse {
-  type: 'init_success'
-  id: string
-}
-
-/**
- * 初始化失败响应
- */
-export interface InitErrorResponse {
-  type: 'init_error'
-  id: string
-  error: string
-}
-
-/**
- * 编译成功响应
- */
-export interface CompileSuccessResponse {
-  type: 'compile_success'
-  id: string
-  payload: {
-    /** Vector artifact 数据（Transferable） */
-    artifact: Uint8Array
-    /** 编译诊断信息 */
-    diagnostics: DiagnosticMessage[]
-  }
-}
-
-/**
- * 编译失败响应（但编译器状态正常）
- */
-export interface CompileErrorResponse {
-  type: 'compile_error'
-  id: string
-  payload: {
-    /** 错误消息 */
-    error: string
-    /** 编译诊断信息 */
-    diagnostics: DiagnosticMessage[]
-  }
-}
-
-/**
- * 重置成功响应
- */
-export interface ResetSuccessResponse {
-  type: 'reset_success'
-  id: string
-}
-
-/**
- * 字体请求 - Worker 请求主线程加载字体
- */
-export interface FontRequestMessage {
-  type: 'font_request'
-  id: string
-  payload: FontRequest
-}
-
-/**
- * Worker 就绪状态
- */
-export interface ReadyMessage {
-  type: 'ready'
-}
-
-// ============================================================================
-// Worker Health Metrics
-// ============================================================================
-
-/**
- * Worker 健康指标 - 用于内存监控和软重启决策
- */
-export interface WorkerHealthMetrics {
-  /** 编译时间 (ms) */
-  compileTime: number
-  /** Artifact 大小 (bytes) */
-  artifactSize: number
-  /** 估算页数 */
-  estimatedPages: number
-  /** 是否发生错误 */
-  hasError: boolean
-  /** 是否发生 Panic */
-  hasPanic: boolean
-  /** Worker 启动时间戳 */
-  workerStartTime: number
-  /** 累计编译次数 */
-  totalCompilations: number
-}
-
-/**
- * 健康指标上报 - Worker 主动推送
- */
-export interface HealthMetricsMessage {
-  type: 'health_metrics'
-  payload: WorkerHealthMetrics
-}
-
-/**
- * 内省数据响应 - 编译成功后主动推送
- * 包含所有追踪标记的位置信息，用于实现源码-预览同步
- */
-export interface IntrospectionResponse {
-  type: 'introspection_result'
-  /** 关联的编译请求 ID */
-  id: string
-  /** 内省数据 */
-  payload: IntrospectionData
-}
-
-/**
- * 所有可能的 Worker 响应类型
- */
-export type WorkerToMainMessage =
-  | InitSuccessResponse
-  | InitErrorResponse
-  | CompileSuccessResponse
-  | CompileErrorResponse
-  | ResetSuccessResponse
-  | FontRequestMessage
-  | ReadyMessage
-  | IntrospectionResponse
-  | OutlineResponse
-  | HealthMetricsMessage
-
-// ============================================================================
-// Helper Types
-// ============================================================================
-
-/**
- * 提取消息 ID 的辅助类型
- */
-export type MessageId<T extends { id?: string }> = T extends { id: infer U } ? U : never
 
 /**
  * 编译器状态
@@ -450,4 +251,3 @@ export interface PendingRequest<T> {
   reject: (error: Error) => void
   timeout?: ReturnType<typeof setTimeout>
 }
-

@@ -6,6 +6,7 @@
  * - Heartbeat-based deadlock detection (5s timeout)
  * - Phoenix Protocol: automatic worker resurrection on crash
  * - State hydration after restart
+ * - Unified Protocol v2.0 with exhaustiveness checking
  * 
  * @module useResilientWorker
  */
@@ -15,8 +16,8 @@ import type {
     WorkerState,
     WorkerToMainMessage,
     CompileResult,
-    WorkerCrashedError,
 } from '../types/bridge.d'
+import { assertNever, sendToWorker, WorkerCrashedError } from '../types/bridge.d'
 
 // ============================================================================
 // Constants
@@ -91,101 +92,7 @@ export function useResilientWorker(): UseResilientWorkerReturn {
     }, [])
 
     // ============================================================================
-    // Worker Message Handler
-    // ============================================================================
-
-    const handleWorkerMessage = useCallback((event: MessageEvent<WorkerToMainMessage>) => {
-        const message = event.data
-
-        // Handle bridge protocol messages
-        if ('kind' in message) {
-            switch (message.kind) {
-                case 'READY':
-                    if (isMountedRef.current) {
-                        setState('IDLE')
-                        restartAttemptsRef.current = 0
-                        setError(null)
-                    }
-                    break
-
-                case 'COMPILE_SUCCESS': {
-                    const pending = pendingRequestsRef.current.get(message.requestId)
-                    if (pending) {
-                        clearTimeout(pending.timeout)
-                        pendingRequestsRef.current.delete(message.requestId)
-                        pending.resolve({
-                            artifact: message.artifact,
-                            timing: message.timing,
-                            hasError: false,
-                            diagnostics: message.diagnostics ?? [],
-                        })
-                    }
-                    if (isMountedRef.current) {
-                        setState('IDLE')
-                    }
-                    break
-                }
-
-                case 'COMPILE_ERROR': {
-                    const pending = pendingRequestsRef.current.get(message.requestId)
-                    if (pending) {
-                        clearTimeout(pending.timeout)
-                        pendingRequestsRef.current.delete(message.requestId)
-                        pending.resolve({
-                            artifact: null,
-                            timing: 0,
-                            hasError: true,
-                            diagnostics: message.diagnostics ?? [],
-                        })
-                    }
-                    if (isMountedRef.current) {
-                        setState('IDLE')
-                    }
-                    break
-                }
-
-                case 'PANIC':
-                    console.error('[useResilientWorker] Worker PANIC:', message.reason)
-                    if (isMountedRef.current) {
-                        setState('CRASHED')
-                        setError(new Error(`Worker crashed: ${message.reason}`) as WorkerCrashedError)
-                    }
-                    // Reject all pending requests
-                    for (const [, pending] of pendingRequestsRef.current) {
-                        clearTimeout(pending.timeout)
-                        pending.reject(new Error(`Worker panicked: ${message.reason}`))
-                    }
-                    pendingRequestsRef.current.clear()
-                    // Trigger Phoenix Protocol
-                    triggerPhoenixProtocol()
-                    break
-
-                case 'HEARTBEAT_ACK':
-                    lastHeartbeatAckRef.current = message.timestamp
-                    break
-
-                case 'RESET_SUCCESS':
-                    // Handle reset success if needed
-                    break
-            }
-        }
-    }, [state])
-
-    // ============================================================================
-    // Worker Error Handler
-    // ============================================================================
-
-    const handleWorkerError = useCallback((event: ErrorEvent) => {
-        console.error('[useResilientWorker] Worker error:', event.message)
-        if (isMountedRef.current) {
-            setState('CRASHED')
-            setError(new Error(event.message))
-        }
-        triggerPhoenixProtocol()
-    }, [])
-
-    // ============================================================================
-    // Phoenix Protocol (Self-Healing)
+    // Phoenix Protocol (Self-Healing) - declared first for reference
     // ============================================================================
 
     const triggerPhoenixProtocol = useCallback(() => {
@@ -205,8 +112,6 @@ export function useResilientWorker(): UseResilientWorkerReturn {
 
         // 1. Force terminate old worker
         if (workerRef.current) {
-            workerRef.current.removeEventListener('message', handleWorkerMessage as EventListener)
-            workerRef.current.removeEventListener('error', handleWorkerError as EventListener)
             workerRef.current.terminate()
             workerRef.current = null
         }
@@ -224,47 +129,118 @@ export function useResilientWorker(): UseResilientWorkerReturn {
         }
         pendingRequestsRef.current.clear()
 
-        // 4. Wait and create new worker
+        // 4. Wait and create new worker (createWorker will be called via effect)
         setTimeout(() => {
             if (isMountedRef.current) {
-                createWorker()
+                // Inline worker creation to avoid circular dependency
+                createWorkerInternal()
             }
         }, RESTART_DELAY_MS)
-    }, [handleWorkerMessage, handleWorkerError])
+    }, [])
 
     // ============================================================================
-    // Worker Creation
+    // Worker Message Handler with Exhaustiveness Checking
     // ============================================================================
 
-    const createWorker = useCallback(() => {
-        if (!isMountedRef.current) return
+    const handleWorkerMessage = useCallback((event: MessageEvent<WorkerToMainMessage>) => {
+        const message = event.data
 
-        setState('BOOTING')
+        // Unified protocol: all messages use 'kind' discriminator
+        switch (message.kind) {
+            case 'READY':
+                if (isMountedRef.current) {
+                    setState('IDLE')
+                    restartAttemptsRef.current = 0
+                    setError(null)
+                }
+                return
 
-        try {
-            // Create new worker
-            workerRef.current = new Worker(
-                new URL('../workers/typst.worker.ts', import.meta.url),
-                { type: 'module' }
-            )
-
-            workerRef.current.addEventListener('message', handleWorkerMessage as EventListener)
-            workerRef.current.addEventListener('error', handleWorkerError as EventListener)
-
-            // Send init message
-            workerRef.current.postMessage({ type: 'init', id: generateRequestId() })
-
-            // Start heartbeat monitoring
-            startHeartbeatMonitor()
-
-        } catch (err) {
-            console.error('[useResilientWorker] Failed to create worker:', err)
-            if (isMountedRef.current) {
-                setState('CRASHED')
-                setError(err instanceof Error ? err : new Error(String(err)))
+            case 'COMPILE_SUCCESS': {
+                const pending = pendingRequestsRef.current.get(message.requestId)
+                if (pending) {
+                    clearTimeout(pending.timeout)
+                    pendingRequestsRef.current.delete(message.requestId)
+                    pending.resolve({
+                        artifact: message.artifact,
+                        timing: message.timing,
+                        hasError: false,
+                        diagnostics: message.diagnostics ?? [],
+                    })
+                }
+                if (isMountedRef.current) {
+                    setState('IDLE')
+                }
+                return
             }
+
+            case 'COMPILE_ERROR': {
+                const pending = pendingRequestsRef.current.get(message.requestId)
+                if (pending) {
+                    clearTimeout(pending.timeout)
+                    pendingRequestsRef.current.delete(message.requestId)
+                    pending.resolve({
+                        artifact: null,
+                        timing: 0,
+                        hasError: true,
+                        diagnostics: message.diagnostics ?? [],
+                    })
+                }
+                if (isMountedRef.current) {
+                    setState('IDLE')
+                }
+                return
+            }
+
+            case 'PANIC':
+                console.error('[useResilientWorker] Worker PANIC:', message.reason)
+                if (isMountedRef.current) {
+                    setState('CRASHED')
+                    setError(new WorkerCrashedError(message.reason, message.stack))
+                }
+                // Reject all pending requests
+                for (const [, pending] of pendingRequestsRef.current) {
+                    clearTimeout(pending.timeout)
+                    pending.reject(new Error(`Worker panicked: ${message.reason}`))
+                }
+                pendingRequestsRef.current.clear()
+                // Trigger Phoenix Protocol
+                triggerPhoenixProtocol()
+                return
+
+            case 'HEARTBEAT_ACK':
+                lastHeartbeatAckRef.current = message.timestamp
+                return
+
+            case 'RESET_SUCCESS':
+                // Handle reset success - transition back to IDLE
+                if (isMountedRef.current) {
+                    setState('IDLE')
+                }
+                return
+
+            case 'OUTLINE_RESULT':
+                // Outline data is handled by TypstWorkerService
+                // This hook focuses on compilation lifecycle
+                return
+
+            default:
+                // Exhaustiveness check - TypeScript will error if we miss a case
+                assertNever(message, `[useResilientWorker] Unknown message kind: ${(message as { kind: string }).kind}`)
         }
-    }, [handleWorkerMessage, handleWorkerError, generateRequestId])
+    }, [triggerPhoenixProtocol])
+
+    // ============================================================================
+    // Worker Error Handler
+    // ============================================================================
+
+    const handleWorkerError = useCallback((event: ErrorEvent) => {
+        console.error('[useResilientWorker] Worker error:', event.message)
+        if (isMountedRef.current) {
+            setState('CRASHED')
+            setError(new Error(event.message))
+        }
+        triggerPhoenixProtocol()
+    }, [triggerPhoenixProtocol])
 
     // ============================================================================
     // Heartbeat Monitoring
@@ -284,19 +260,54 @@ export function useResilientWorker(): UseResilientWorkerReturn {
             const now = Date.now()
             const timeSinceLastAck = now - lastHeartbeatAckRef.current
 
-            // Send heartbeat
-            workerRef.current.postMessage({
+            // Send heartbeat using unified protocol
+            sendToWorker(workerRef.current, {
                 kind: 'HEARTBEAT',
                 timestamp: now,
             })
 
-            // Check for timeout (deadlock detection)
-            if (timeSinceLastAck > HEARTBEAT_TIMEOUT_MS && state === 'BUSY') {
+            // Check for timeout (deadlock detection) - enhanced to check all non-crashed states
+            if (timeSinceLastAck > HEARTBEAT_TIMEOUT_MS && 
+                !['CRASHED', 'RECOVERING', 'BOOTING'].includes(stateRef.current)) {
                 console.warn('[useResilientWorker] Heartbeat timeout - worker may be deadlocked')
                 triggerPhoenixProtocol()
             }
         }, HEARTBEAT_TIMEOUT_MS / 2) // Check at half the timeout interval
-    }, [state, triggerPhoenixProtocol])
+    }, [triggerPhoenixProtocol])
+
+    // ============================================================================
+    // Worker Creation (Internal)
+    // ============================================================================
+
+    const createWorkerInternal = useCallback(() => {
+        if (!isMountedRef.current) return
+
+        setState('BOOTING')
+
+        try {
+            // Create new worker
+            workerRef.current = new Worker(
+                new URL('../workers/typst.worker.ts', import.meta.url),
+                { type: 'module' }
+            )
+
+            workerRef.current.addEventListener('message', handleWorkerMessage as EventListener)
+            workerRef.current.addEventListener('error', handleWorkerError as EventListener)
+
+            // Send init message using unified protocol
+            sendToWorker(workerRef.current, { kind: 'INIT' })
+
+            // Start heartbeat monitoring
+            startHeartbeatMonitor()
+
+        } catch (err) {
+            console.error('[useResilientWorker] Failed to create worker:', err)
+            if (isMountedRef.current) {
+                setState('CRASHED')
+                setError(err instanceof Error ? err : new Error(String(err)))
+            }
+        }
+    }, [handleWorkerMessage, handleWorkerError, startHeartbeatMonitor])
 
     // ============================================================================
     // Compile Function
@@ -304,16 +315,15 @@ export function useResilientWorker(): UseResilientWorkerReturn {
 
     const compile = useCallback(async (source: string, options?: CompileOptions): Promise<CompileResult> => {
         // Check if worker is ready
-        if (state !== 'IDLE' && state !== 'BUSY') {
+        if (stateRef.current !== 'IDLE' && stateRef.current !== 'BUSY') {
             // Wait for worker to be ready or throw
-            if (state === 'CRASHED') {
+            if (stateRef.current === 'CRASHED') {
                 throw new Error('Worker is crashed. Call restart() to recover.')
             }
-            if (state === 'BOOTING' || state === 'RECOVERING') {
+            if (stateRef.current === 'BOOTING' || stateRef.current === 'RECOVERING') {
                 // Wait a bit for worker to become ready
                 await new Promise<void>((resolve, reject) => {
                     const checkInterval = setInterval(() => {
-                        // Use stateRef to get current state in closure
                         if (stateRef.current === 'IDLE') {
                             clearInterval(checkInterval)
                             resolve()
@@ -351,18 +361,16 @@ export function useResilientWorker(): UseResilientWorkerReturn {
 
             pendingRequestsRef.current.set(requestId, { resolve, reject, timeout })
 
-            // Send compile request (using legacy protocol for now)
-            workerRef.current!.postMessage({
-                type: 'compile',
-                id: requestId,
-                payload: {
-                    source,
-                    mainFilePath: options?.mainFilePath ?? '/main.typ',
-                    format: options?.format ?? 'vector',
-                },
+            // Send compile request using unified protocol
+            sendToWorker(workerRef.current!, {
+                kind: 'COMPILE',
+                source,
+                requestId,
+                mainFilePath: options?.mainFilePath ?? '/main.typ',
+                format: options?.format ?? 'vector',
             })
         })
-    }, [state, generateRequestId, triggerPhoenixProtocol])
+    }, [generateRequestId, triggerPhoenixProtocol])
 
     // ============================================================================
     // Manual Restart
@@ -379,7 +387,7 @@ export function useResilientWorker(): UseResilientWorkerReturn {
 
     useEffect(() => {
         isMountedRef.current = true
-        createWorker()
+        createWorkerInternal()
 
         return () => {
             isMountedRef.current = false
@@ -390,7 +398,7 @@ export function useResilientWorker(): UseResilientWorkerReturn {
             }
 
             if (workerRef.current) {
-                workerRef.current.postMessage({ kind: 'DISPOSE' })
+                sendToWorker(workerRef.current, { kind: 'DISPOSE' })
                 workerRef.current.terminate()
             }
 
@@ -400,7 +408,7 @@ export function useResilientWorker(): UseResilientWorkerReturn {
             }
             pendingRequestsRef.current.clear()
         }
-    }, [])
+    }, [createWorkerInternal])
 
     return {
         compile,

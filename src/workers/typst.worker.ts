@@ -1,21 +1,35 @@
 /**
- * Typst Compiler Web Worker (Protocol 80 - Standardized)
- * * 架构说明：
- * - 严格遵循 Actor Model，仅通过 Bridge Protocol 通信
- * - 实现 Zero-Copy 传输
- * - 具备自我健康检查与汇报机制
+ * Typst Compiler Web Worker (Protocol v2.0 - Unified)
+ * 
+ * Architecture:
+ * - Strict Actor Model: communicates only via Bridge Protocol
+ * - Zero-Copy transfer for binary artifacts
+ * - Self-health monitoring with panic recovery
+ * - Type-safe exhaustiveness checking
+ * 
+ * @module typst.worker
  */
 
 import {
   createTypstCompiler,
   type TypstCompiler,
 } from '@myriaddreamin/typst.ts/compiler'
+
 import type {
-  WorkerToMainMessage,
   MainToWorkerMessage,
+  WorkerToMainMessage,
   DiagnosticInfo,
+  OutlineHeading,
+  OutlineFigure,
   WorkerHealthMetrics,
 } from '../types/bridge.d'
+
+import { assertNever, postWorkerResponse } from '../types/bridge.d'
+
+import type {
+  TypstHeadingQueryResult,
+  TypstFigureQueryResult,
+} from './types'
 
 // ============================================================================
 // Worker State & Constants
@@ -24,7 +38,7 @@ import type {
 let compiler: TypstCompiler | null = null
 let isInitializing = false
 
-/** 性能监控 */
+/** Performance monitoring stats */
 const perfStats = {
   startTime: Date.now(),
   compileCount: 0,
@@ -32,21 +46,22 @@ const perfStats = {
 }
 
 // ============================================================================
+// Type-Safe Message Posting
+// ============================================================================
+
+/**
+ * Post a message to the main thread with optional transferables
+ * Uses the unified protocol from bridge.d.ts
+ */
+function postMessage(message: WorkerToMainMessage, transfer?: Transferable[]): void {
+  postWorkerResponse(message, transfer)
+}
+
+// ============================================================================
 // Helper Functions
 // ============================================================================
 
-/** * 统一消息发送网关 
- * 自动处理 Zero-Copy 逻辑
- */
-function postBridgeMessage(message: WorkerToMainMessage, transfer?: Transferable[]) {
-  if (transfer && transfer.length > 0) {
-    (self as any).postMessage(message, transfer)
-  } else {
-    self.postMessage(message)
-  }
-}
-
-/** 获取 WASM 路径 */
+/** Get WASM module URL */
 function getWasmModuleUrl(): string {
   return new URL(
     '@myriaddreamin/typst-ts-web-compiler/pkg/typst_ts_web_compiler_bg.wasm',
@@ -54,16 +69,34 @@ function getWasmModuleUrl(): string {
   ).href
 }
 
-/** 简单的页数估算 */
+/** Estimate page count from artifact size */
 function estimatePageCount(size: number): number {
   return Math.max(1, Math.ceil(size / (50 * 1024)))
+}
+
+/**
+ * Extract plain text from Typst content (recursive)
+ */
+function extractTextContent(content: unknown): string {
+  if (!content) return ''
+  if (typeof content === 'string') return content
+  if (typeof content === 'object' && content !== null) {
+    if ('text' in content) return String((content as { text: unknown }).text)
+    if (Array.isArray(content)) {
+      return content.map(extractTextContent).join('')
+    }
+  }
+  return String(content)
 }
 
 // ============================================================================
 // Core Logic
 // ============================================================================
 
-async function initCompiler() {
+/**
+ * Initialize the Typst compiler
+ */
+async function initCompiler(): Promise<void> {
   if (compiler || isInitializing) return
 
   isInitializing = true
@@ -74,35 +107,42 @@ async function initCompiler() {
       getModule: () => getWasmModuleUrl(),
     })
     isInitializing = false
-    postBridgeMessage({ kind: 'READY' })
+    postMessage({ kind: 'READY' })
   } catch (e) {
     isInitializing = false
     console.error('[Worker] Init failed', e)
-    // 初始化失败通常是致命的，直接 Panic 让 Supervisor 重启
+    // Fatal error - report panic and let Supervisor restart
     throw e
   }
 }
 
 /**
- * Extract outline data (headings + figures) and send to main thread
- * Uses legacy protocol for OutlinePanel compatibility
+ * Extract outline data and send to main thread using unified protocol
  */
-async function extractAndSendOutline(requestId: string, mainFilePath: string) {
+async function extractAndSendOutline(requestId: string, mainFilePath: string): Promise<void> {
   if (!compiler) return
 
   try {
-    // Query headings
-    const headingsRaw = await compiler.query({ selector: 'heading', mainFilePath }) as unknown[]
-    const headings = (headingsRaw || []).map((h: any) => ({
+    // Query headings with type-safe casting
+    const headingsRaw = await compiler.query({ 
+      selector: 'heading', 
+      mainFilePath 
+    }) as TypstHeadingQueryResult[]
+
+    const headings: OutlineHeading[] = (headingsRaw ?? []).map((h) => ({
       level: h.level ?? 1,
       body: extractTextContent(h.body),
       page: h.location?.page ?? 1,
       y: h.location?.position?.y ?? 0,
     }))
 
-    // Query figures
-    const figuresRaw = await compiler.query({ selector: 'figure', mainFilePath }) as unknown[]
-    const figures = (figuresRaw || []).map((f: any, idx: number) => ({
+    // Query figures with type-safe casting
+    const figuresRaw = await compiler.query({ 
+      selector: 'figure', 
+      mainFilePath 
+    }) as TypstFigureQueryResult[]
+
+    const figures: OutlineFigure[] = (figuresRaw ?? []).map((f, idx) => ({
       kind: f.kind ?? 'image',
       caption: extractTextContent(f.caption?.body),
       number: idx + 1,
@@ -113,19 +153,19 @@ async function extractAndSendOutline(requestId: string, mainFilePath: string) {
     // Estimate page count from max page in headings/figures
     const maxPage = Math.max(
       1,
-      ...headings.map((h: { page: number }) => h.page),
-      ...figures.map((f: { page: number }) => f.page)
+      ...headings.map((h) => h.page),
+      ...figures.map((f) => f.page)
     )
 
-    // Send outline_result using legacy protocol (type instead of kind)
-    self.postMessage({
-      type: 'outline_result',
-      id: requestId,
+    // Send outline using unified protocol (kind discriminator)
+    postMessage({
+      kind: 'OUTLINE_RESULT',
+      requestId,
       payload: {
         headings,
         figures,
         pageCount: maxPage,
-      }
+      },
     })
   } catch (err) {
     console.warn('[Worker] Outline query failed:', err)
@@ -133,54 +173,31 @@ async function extractAndSendOutline(requestId: string, mainFilePath: string) {
 }
 
 /**
- * Extract plain text from Typst content
+ * Compile Typst source code
  */
-function extractTextContent(content: unknown): string {
-  if (!content) return ''
-  if (typeof content === 'string') return content
-  if (typeof content === 'object' && content !== null) {
-    // Handle content objects with text property
-    if ('text' in content) return String((content as { text: unknown }).text)
-    // Handle arrays of content
-    if (Array.isArray(content)) {
-      return content.map(extractTextContent).join('')
-    }
-  }
-  return String(content)
-}
-
 async function runCompile(
   requestId: string,
-  action: 'full' | 'incremental',
-  payload: { source: string; mainFilePath: string; path?: string; content?: string; format?: 'vector' | 'pdf' }
-) {
+  payload: { 
+    source: string
+    mainFilePath: string
+    format?: 'vector' | 'pdf' 
+  }
+): Promise<void> {
   if (!compiler) {
     throw new Error('Compiler not initialized')
   }
 
   const start = performance.now()
-  let result: any
 
   try {
-    if (action === 'full') {
-      compiler.resetShadow()
-      compiler.addSource(payload.mainFilePath, payload.source)
-      result = await compiler.compile({
-        mainFilePath: payload.mainFilePath,
-        format: payload.format === 'pdf' ? 1 : 0,
-        diagnostics: 'full',
-      })
-    } else {
-      // 增量更新
-      if (payload.path && payload.content) {
-        compiler.addSource(payload.path, payload.content)
-      }
-      result = await compiler.compile({
-        mainFilePath: payload.mainFilePath, // 增量编译也需要指定入口
-        format: 0, // 增量通常只用于预览(vector)
-        diagnostics: 'full',
-      })
-    }
+    compiler.resetShadow()
+    compiler.addSource(payload.mainFilePath, payload.source)
+    
+    const result = await compiler.compile({
+      mainFilePath: payload.mainFilePath,
+      format: payload.format === 'pdf' ? 1 : 0,
+      diagnostics: 'full',
+    })
 
     const duration = performance.now() - start
     perfStats.compileCount++
@@ -191,105 +208,142 @@ async function runCompile(
 
     if (artifact) {
       // ✅ Happy Path: Zero-Copy Transfer
-      postBridgeMessage({
-        kind: 'COMPILE_SUCCESS',
-        requestId,
-        artifact,
-        timing: duration,
-        diagnostics
-      }, [artifact.buffer])
+      postMessage(
+        {
+          kind: 'COMPILE_SUCCESS',
+          requestId,
+          artifact,
+          timing: duration,
+          diagnostics,
+        },
+        [artifact.buffer] // Transfer ownership for zero-copy
+      )
 
-      // 异步上报健康数据，不阻塞主流程
+      // Async health report (non-blocking)
       reportHealth(artifact.byteLength)
 
-      // 🔍 Extract and send outline data (legacy protocol for OutlinePanel compatibility)
+      // Extract and send outline data
       try {
         await extractAndSendOutline(requestId, payload.mainFilePath)
       } catch (outlineErr) {
         console.warn('[Worker] Failed to extract outline:', outlineErr)
       }
     } else {
-      // 编译逻辑错误（如语法错误），非 Worker 崩溃
-      postBridgeMessage({
+      // Compilation logic error (e.g., syntax error), not a Worker crash
+      postMessage({
         kind: 'COMPILE_ERROR',
         requestId,
         error: 'Compilation produced no output',
-        diagnostics
+        diagnostics,
       })
     }
-
   } catch (err) {
     console.error('[Worker] Compile Exception:', err)
-    postBridgeMessage({
+    postMessage({
       kind: 'COMPILE_ERROR',
       requestId,
       error: err instanceof Error ? err.message : String(err),
-      diagnostics: []
+      diagnostics: [],
     })
   }
 }
 
-function reportHealth(lastArtifactSize: number) {
+/**
+ * Reset compiler state
+ */
+function handleReset(requestId: string): void {
+  if (compiler) {
+    compiler.resetShadow()
+  }
+  postMessage({
+    kind: 'RESET_SUCCESS',
+    requestId,
+  })
+}
+
+/**
+ * Report health metrics (for future use)
+ */
+function reportHealth(lastArtifactSize: number): void {
   const metrics: WorkerHealthMetrics = {
-    memoryUsage: (performance as any).memory?.usedJSHeapSize ?? 0,
+    memoryUsage: getMemoryUsage(),
     uptime: Date.now() - perfStats.startTime,
     compileCount: perfStats.compileCount,
-    averageCompileTime: perfStats.lastDuration, // 简化处理
+    averageCompileTime: perfStats.lastDuration,
     lastArtifactSize,
-    estimatedPages: estimatePageCount(lastArtifactSize)
+    estimatedPages: estimatePageCount(lastArtifactSize),
   }
 
-  // TODO: 通过 'HEALTH_REPORT' 消息发送到主线程
-  // 目前 Protocol 80 尚未定义该消息，保留数据供未来使用
+  // TODO: Send via 'HEALTH_REPORT' message when protocol supports it
   void metrics
 }
 
-function dispose() {
-  if (compiler && (compiler as any).dispose) {
-    (compiler as any).dispose()
+/**
+ * Get memory usage (Chrome-specific API)
+ */
+function getMemoryUsage(): number {
+  // Chrome-specific API
+  const perf = performance as Performance & { 
+    memory?: { usedJSHeapSize?: number } 
+  }
+  return perf.memory?.usedJSHeapSize ?? 0
+}
+
+/**
+ * Dispose compiler and free WASM memory
+ */
+function dispose(): void {
+  if (compiler) {
+    // Type-safe dispose check
+    const disposableCompiler = compiler as TypstCompiler & { 
+      dispose?: () => void 
+    }
+    if (typeof disposableCompiler.dispose === 'function') {
+      disposableCompiler.dispose()
+    }
   }
   compiler = null
 }
 
 // ============================================================================
-// Message Loop
+// Message Loop with Exhaustiveness Checking
 // ============================================================================
 
 self.onmessage = (event: MessageEvent<MainToWorkerMessage>) => {
   const msg = event.data
 
-  // 严格根据 kind 分发
-  // 注意：这里假设 MainToWorkerMessage 已经统一为 { kind: ... } 格式
-  // 如果你的类型定义还没更新，这里需要做适配
+  // Strict switch with exhaustiveness check
+  switch (msg.kind) {
+    case 'INIT':
+      initCompiler().catch(reportPanic)
+      return
 
-  // 兼容层：将旧协议映射到新逻辑 (Deep Clean 过渡期保险措施)
-  const type = (msg as any).type
-  const kind = (msg as any).kind
+    case 'COMPILE':
+      runCompile(msg.requestId, {
+        source: msg.source,
+        mainFilePath: msg.mainFilePath ?? '/main.typ',
+        format: msg.format,
+      }).catch(reportPanic)
+      return
 
-  if (kind === 'HEARTBEAT') {
-    postBridgeMessage({
-      kind: 'HEARTBEAT_ACK',
-      timestamp: (msg as any).timestamp
-    })
-    return
-  }
+    case 'HEARTBEAT':
+      postMessage({
+        kind: 'HEARTBEAT_ACK',
+        timestamp: msg.timestamp,
+      })
+      return
 
-  if (type === 'init' || kind === 'INIT') {
-    initCompiler().catch(reportPanic)
-    return
-  }
+    case 'RESET':
+      handleReset(msg.requestId)
+      return
 
-  if (type === 'compile' || kind === 'COMPILE') {
-    const payload = (msg as any).payload || msg
-    runCompile((msg as any).id || (msg as any).requestId, 'full', payload).catch(reportPanic)
-    return
-  }
+    case 'DISPOSE':
+      dispose()
+      return
 
-  // 暂时不支持 incremental_update 的旧协议映射，强制要求新代码使用标准调用
-
-  if (kind === 'DISPOSE') {
-    dispose()
-    return
+    default:
+      // Exhaustiveness check - TypeScript will error if we miss a case
+      assertNever(msg, `[Worker] Unknown message kind: ${(msg as { kind: string }).kind}`)
   }
 }
 
@@ -297,12 +351,15 @@ self.onmessage = (event: MessageEvent<MainToWorkerMessage>) => {
 // Safety Nets
 // ============================================================================
 
-function reportPanic(err: any) {
+/**
+ * Report panic to main thread
+ */
+function reportPanic(err: unknown): void {
   console.error('[Worker PANIC]', err)
-  postBridgeMessage({
+  postMessage({
     kind: 'PANIC',
     reason: err instanceof Error ? err.message : String(err),
-    stack: err instanceof Error ? err.stack : undefined
+    stack: err instanceof Error ? err.stack : undefined,
   })
 }
 
@@ -311,9 +368,8 @@ self.onerror = (e) => {
   return true // Prevent default handling
 }
 
-self.onunhandledrejection = (e) => {
+self.onunhandledrejection = (e: PromiseRejectionEvent) => {
   reportPanic(e.reason)
 }
 
-// 启动时发送 Ready (如果不需要显式 Init)
-// 但我们的协议要求显式 Init，所以这里保持静默，等待主线程握手
+// Worker is silent until explicit INIT message from main thread
