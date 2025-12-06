@@ -290,3 +290,206 @@
   )
 }
 
+// ============================================================================
+// Semantic Outline Extraction - 语义大纲提取
+// ============================================================================
+
+/// 收集文档大纲（标题）
+///
+/// 使用 Typst 原生 query() 提取所有 heading 元素，
+/// 包含标题文本、级别、页码和位置信息。
+///
+/// 返回格式：
+/// ```
+/// (
+///   (level: 1, body: "章节标题", page: 1, x: 72pt, y: 100pt),
+///   (level: 2, body: "子标题", page: 1, x: 72pt, y: 200pt),
+///   ...
+/// )
+/// ```
+#let collect-headings() = {
+  context {
+    let headings = query(heading)
+    
+    headings.map(h => {
+      let loc = h.location()
+      let pos = loc.position()
+      
+      (
+        level: h.level,
+        body: if type(h.body) == content {
+          // 将 content 转为纯文本（简化处理）
+          repr(h.body).replace("\"", "").replace("[", "").replace("]", "")
+        } else {
+          str(h.body)
+        },
+        page: pos.page,
+        x: pos.x,
+        y: pos.y,
+      )
+    })
+  }
+}
+
+/// 收集文档图表
+///
+/// 使用 Typst 原生 query() 提取所有 figure 元素，
+/// 包含图表标题、类型、编号、页码和位置信息。
+///
+/// 返回格式：
+/// ```
+/// (
+///   (kind: "image", caption: "图片描述", number: 1, page: 1, x: 72pt, y: 300pt),
+///   (kind: "table", caption: "表格标题", number: 1, page: 2, x: 72pt, y: 100pt),
+///   ...
+/// )
+/// ```
+#let collect-figures() = {
+  context {
+    let figures = query(figure)
+    
+    figures.map(f => {
+      let loc = f.location()
+      let pos = loc.position()
+      
+      // 获取 figure 类型（image, table, raw 等）
+      let fig-kind = if f.kind != auto {
+        str(f.kind)
+      } else {
+        "figure"
+      }
+      
+      // 获取图表编号
+      let fig-number = counter(figure.where(kind: f.kind)).at(loc)
+      
+      (
+        kind: fig-kind,
+        caption: if f.caption != none {
+          let cap = f.caption
+          if type(cap.body) == content {
+            repr(cap.body).replace("\"", "").replace("[", "").replace("]", "")
+          } else if cap.body != none {
+            str(cap.body)
+          } else {
+            ""
+          }
+        } else {
+          ""
+        },
+        number: if fig-number.len() > 0 { fig-number.first() } else { 0 },
+        page: pos.page,
+        x: pos.x,
+        y: pos.y,
+      )
+    })
+  }
+}
+
+/// 收集文档标签
+///
+/// 提取所有带标签的元素，用于交叉引用跳转。
+///
+/// 返回格式：
+/// ```
+/// (
+///   (label: "sec:intro", page: 1, x: 72pt, y: 100pt),
+///   ...
+/// )
+/// ```
+#let collect-labels() = {
+  context {
+    // 查询所有带标签的元素
+    let labeled = query(selector(<_>).or(heading).or(figure).or(math.equation.where(block: true)))
+    
+    labeled.filter(el => el.has("label") and el.label != none).map(el => {
+      let loc = el.location()
+      let pos = loc.position()
+      
+      (
+        label: str(el.label),
+        page: pos.page,
+        x: pos.x,
+        y: pos.y,
+      )
+    })
+  }
+}
+
+/// 收集完整文档大纲
+///
+/// 整合 headings、figures、labels 为完整的文档结构信息。
+/// 主要用于生成交互式大纲面板。
+#let collect-outline() = {
+  context {
+    let headings = collect-headings()
+    let figures = collect-figures()
+    
+    (
+      headings: headings,
+      figures: figures,
+      pageCount: counter(page).final().first(),
+    )
+  }
+}
+
+/// 输出大纲数据为 metadata
+///
+/// 在文档末尾调用，将完整大纲信息以 metadata 形式嵌入文档。
+/// 前端可以通过解析 artifact 提取此信息。
+///
+/// 使用方法：
+/// ```typst
+/// #import "introspection.typ": emit-outline
+/// 
+/// // ... 文档内容 ...
+///
+/// #emit-outline()
+/// ```
+#let emit-outline() = {
+  place(
+    dx: 0pt,
+    dy: 0pt,
+    context {
+      let headings = query(heading).map(h => {
+        let loc = h.location()
+        let pos = loc.position()
+        
+        (
+          level: h.level,
+          body: if type(h.body) == content {
+            repr(h.body).replace("\"", "").replace("[", "").replace("]", "")
+          } else {
+            str(h.body)
+          },
+          page: pos.page,
+          y: pos.y,
+        )
+      })
+      
+      let figures = query(figure).map(f => {
+        let loc = f.location()
+        let pos = loc.position()
+        let fig-kind = if f.kind != auto { str(f.kind) } else { "figure" }
+        let fig-number = counter(figure.where(kind: f.kind)).at(loc)
+        
+        (
+          kind: fig-kind,
+          caption: if f.caption != none and f.caption.body != none {
+            repr(f.caption.body).replace("\"", "").replace("[", "").replace("]", "")
+          } else { "" },
+          number: if fig-number.len() > 0 { fig-number.first() } else { 0 },
+          page: pos.page,
+          y: pos.y,
+        )
+      })
+      
+      metadata((
+        kind: "outline-data",
+        headings: headings,
+        figures: figures,
+        pageCount: counter(page).final().first(),
+      ))
+    }
+  )
+}
+

@@ -36,6 +36,14 @@ let renderQueue: Promise<boolean | void> = Promise.resolve()
 /** 当前渲染版本 - 用于取消过时的渲染任务 */
 let currentRenderVersion = 0
 
+/** Panic 冷却期 - 防止 panic 后连续渲染导致的 spam */
+let panicCooldownUntil = 0
+const PANIC_COOLDOWN_MS = 3000
+
+/** 连续 panic 计数 - 用于指数退避 */
+let consecutivePanicCount = 0
+const MAX_PANIC_COOLDOWN_MS = 10000
+
 async function getOrInitRenderer(): Promise<TypstRenderer> {
   if (rendererInstance) {
     return rendererInstance
@@ -69,13 +77,40 @@ async function getOrInitRenderer(): Promise<TypstRenderer> {
 }
 
 /**
- * 检查 Uint8Array 是否有效（buffer 未被 detach）
+ * 检查 Uint8Array 是否有效（buffer 未被 detach 且有有效内容）
+ * 
+ * 增强验证以避免将无效数据传递给 renderer 导致 WASM panic
  */
 function isValidArtifact(artifact: Uint8Array): boolean {
   try {
     // 如果 buffer 已被 transfer，访问 byteLength 会返回 0 或抛出异常
-    return artifact.buffer.byteLength > 0 && artifact.byteLength > 0
-  } catch {
+    if (artifact.buffer.byteLength === 0 || artifact.byteLength === 0) {
+      return false
+    }
+    // 检查最小有效大小（typst vector format 有头信息，至少需要 100+ bytes）
+    // 增加最小尺寸要求以过滤掉明显无效的 artifact
+    if (artifact.byteLength < 100) {
+      console.warn('[TypstPreview] Artifact too small:', artifact.byteLength, 'bytes')
+      return false
+    }
+    
+    // 验证 artifact 不是全零（可能是 transfer 后的清空 buffer）
+    let hasNonZero = false
+    const checkLength = Math.min(artifact.byteLength, 64)
+    for (let i = 0; i < checkLength; i++) {
+      if (artifact[i] !== 0) {
+        hasNonZero = true
+        break
+      }
+    }
+    if (!hasNonZero) {
+      console.warn('[TypstPreview] Artifact appears to be empty (all zeros)')
+      return false
+    }
+    
+    return true
+  } catch (e) {
+    console.warn('[TypstPreview] Artifact validation error:', e)
     return false
   }
 }
@@ -93,6 +128,12 @@ async function queueRender(
 ): Promise<boolean> {
   // 创建一个新的 Promise 加入队列
   const renderTask = renderQueue.then(async () => {
+    // 检查 panic 冷却期
+    if (Date.now() < panicCooldownUntil) {
+      console.warn('[TypstPreview] In panic cooldown period, skipping render')
+      return false
+    }
+
     // 检查版本，如果已过时则跳过
     if (version !== currentRenderVersion) {
       return false
@@ -100,7 +141,7 @@ async function queueRender(
 
     // 检查 artifact 有效性
     if (!isValidArtifact(artifact)) {
-      console.warn('[TypstPreview] Invalid artifact buffer (possibly transferred)')
+      console.warn('[TypstPreview] Invalid artifact buffer (possibly transferred or too small)')
       return false
     }
 
@@ -118,6 +159,9 @@ async function queueRender(
         format: 'vector',
         container,
       })
+      
+      // 成功渲染，重置 panic 计数器
+      consecutivePanicCount = 0
       return true
     } catch (error) {
       // 捕获 Rust panic 和其他渲染错误
@@ -125,11 +169,27 @@ async function queueRender(
       
       // 检查是否是 Rust panic（通常包含 "panicked" 关键词）
       if (errorMsg.includes('panicked') || errorMsg.includes('unwrap')) {
-        console.error('[TypstPreview] Rust panic detected, reinitializing renderer...')
+        consecutivePanicCount++
+        
+        // 使用指数退避计算冷却时间
+        const cooldownTime = Math.min(
+          PANIC_COOLDOWN_MS * Math.pow(1.5, consecutivePanicCount - 1),
+          MAX_PANIC_COOLDOWN_MS
+        )
+        
+        console.warn(
+          `[TypstPreview] Rust panic #${consecutivePanicCount}, entering cooldown for ${Math.round(cooldownTime)}ms`
+        )
+        
+        // 设置冷却期，防止连续 panic
+        panicCooldownUntil = Date.now() + cooldownTime
         
         // 重置渲染器实例，下次渲染时重新初始化
         rendererInstance = null
         rendererInitPromise = null
+      } else {
+        // 非 panic 错误，重置计数器
+        consecutivePanicCount = 0
       }
       
       throw error

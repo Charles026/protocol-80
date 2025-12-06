@@ -24,8 +24,9 @@ import type {
   FontResponse,
   CompilerState,
   IntrospectionData,
-  SourceMarker,
-  TypstRect,
+  OutlineData,
+  OutlineHeading,
+  OutlineFigure,
 } from './types'
 
 // ============================================================================
@@ -254,12 +255,24 @@ function disposeCompiler(): void {
 // ============================================================================
 
 /**
+ * 内省功能开关
+ * 
+ * 当前禁用，因为 typst.ts 的 query API 在当前版本中不可直接使用。
+ * query 需要在编译后的 snapshot 上调用，而不是直接在 compiler 上。
+ * 
+ * TODO: 待 typst.ts 提供更好的 query 支持后启用此功能
+ */
+const INTROSPECTION_ENABLED = false
+
+/**
  * 内省选择器 - 用于查询文档中的追踪标记
  * 
  * 查询所有包含 kind: "pos" 的 metadata 元素
  * 这些元素由 introspection.typ 模块中的 trace-node 函数插入
+ * 
+ * @internal 保留供未来 query API 启用时使用
  */
-const INTROSPECTION_SELECTOR = 'metadata.where(value: (kind: "pos"))'
+// const INTROSPECTION_SELECTOR = 'metadata.where(value: (kind: "pos"))'
 
 /**
  * 查询内省数据
@@ -267,108 +280,35 @@ const INTROSPECTION_SELECTOR = 'metadata.where(value: (kind: "pos"))'
  * 在编译成功后调用，查询文档中的所有追踪标记位置
  * 主动推送给主线程，减少点击时的延迟
  * 
- * @param mainFilePath - 主文件路径
- * @returns 内省数据，如果查询失败返回 null
+ * @param _mainFilePath - 主文件路径（当前未使用）
+ * @returns 内省数据，如果查询失败或禁用返回 null
+ * 
+ * @remarks
+ * 当前实现已禁用，因为 typst.ts 的 query API 需要特殊处理：
+ * 1. query 必须在编译后的 TypstCompileWorld/snapshot 上调用
+ * 2. 当前 createTypstCompiler() 返回的 compiler 不直接暴露此功能
+ * 3. 需要使用 compiler.snapshot() 获取编译结果后再 query
+ * 
+ * 未来实现方向：
+ * - 使用 compiler.snapshot() 创建编译快照
+ * - 在快照上调用 query()
+ * - 或者在 Typst 源码中直接输出 JSON 格式的内省数据
  */
-function queryIntrospection(mainFilePath: string): IntrospectionData | null {
+function queryIntrospection(_mainFilePath: string): IntrospectionData | null {
+  // 功能当前禁用
+  if (!INTROSPECTION_ENABLED) {
+    return null
+  }
+
   if (!compiler) {
-    console.warn('[Worker] Cannot query introspection: compiler not initialized')
     return null
   }
 
-  try {
-    // 使用 Typst 的 query API 查询所有追踪标记
-    // TypstCompiler.query 签名: query(mainFilePath: string, inputs: array[][] | null, selector: string, field?: string)
-    // 使用类型断言绕过严格类型检查，因为 typst.ts 的类型定义可能不完整
-    const compilerAny = compiler as unknown as {
-      query: (mainFilePath: string, inputs: null, selector: string, field?: string | null) => string
-    }
-
-    let queryResult: string
-    try {
-      queryResult = compilerAny.query(mainFilePath, null, INTROSPECTION_SELECTOR, null)
-    } catch (queryError) {
-      // query 方法可能不存在或调用失败
-      console.warn('[Worker] Query API not available or failed:', queryError)
-      return null
-    }
-
-    // 解析查询结果
-    let positions: Array<{
-      value: {
-        kind: string
-        id: string
-        page: number
-        x: { pt: number } | number
-        y: { pt: number } | number
-      }
-    }> = []
-
-    try {
-      positions = JSON.parse(queryResult)
-    } catch {
-      // 查询结果可能为空或格式异常
-      console.warn('[Worker] Failed to parse introspection query result')
-      return null
-    }
-
-    if (!Array.isArray(positions)) {
-      return null
-    }
-
-    // 转换为 SourceMarker 格式
-    const markers: SourceMarker[] = []
-    const markerMap = new Map<string, SourceMarker>()
-
-    for (const item of positions) {
-      const value = item?.value
-      if (!value || value.kind !== 'pos') continue
-
-      const id = value.id
-      const page = typeof value.page === 'number' ? value.page : 1
-      const x = typeof value.x === 'object' ? value.x.pt : (value.x as number)
-      const y = typeof value.y === 'object' ? value.y.pt : (value.y as number)
-
-      // 查询元素尺寸（如果可用）
-      // 注：Typst query 返回的 position 不包含尺寸，需要额外查询 layout()
-      // 这里先使用默认尺寸，后续可以通过 layout 查询获取精确尺寸
-      const defaultWidth = 100 // pt
-      const defaultHeight = 20 // pt
-
-      const marker: SourceMarker = {
-        id,
-        rect: [x, y, defaultWidth, defaultHeight] as TypstRect,
-        page,
-        type: inferMarkerType(id),
-      }
-
-      markerMap.set(id, marker)
-    }
-
-    markers.push(...markerMap.values())
-
-    // 获取页面信息
-    // 注：目前 typst.ts 不直接暴露页面信息 API，使用默认值
-    // 后续可以通过解析 artifact 获取精确页面尺寸
-    const pageSizes: Array<[number, number]> = [[595.28, 841.89]] // A4 默认
-    const totalPages = markers.length > 0 
-      ? Math.max(1, ...markers.map(m => m.page))
-      : 1
-
-    // 填充页面尺寸数组
-    while (pageSizes.length < totalPages) {
-      pageSizes.push([595.28, 841.89])
-    }
-
-    return {
-      markers,
-      totalPages,
-      pageSizes,
-    }
-  } catch (error) {
-    console.warn('[Worker] Introspection query failed:', error)
-    return null
-  }
+  // TODO: 实现正确的 query 调用
+  // const snapshot = compiler.snapshot(null, mainFilePath, null)
+  // const queryResult = snapshot.query(0, INTROSPECTION_SELECTOR)
+  
+  return null
 }
 
 /**
@@ -382,20 +322,236 @@ function inferMarkerType(id: string): 'heading' | 'paragraph' | 'block' | 'inlin
   return 'inline'
 }
 
+// 保留 inferMarkerType 用于未来使用
+void inferMarkerType
+
 /**
  * 发送内省数据到主线程
  * 
  * 在编译成功后立即调用，主动推送数据以减少后续点击延迟
+ * 
+ * @remarks 当前功能已禁用，等待 typst.ts query API 支持
  */
-function pushIntrospectionData(requestId: string, mainFilePath: string): void {
+function pushIntrospectionData(_requestId: string, mainFilePath: string): void {
+  if (!INTROSPECTION_ENABLED) {
+    return
+  }
+
   const introspection = queryIntrospection(mainFilePath)
   
   if (introspection && introspection.markers.length > 0) {
     postResponse({
       type: 'introspection_result',
-      id: requestId,
+      id: _requestId,
       payload: introspection,
     })
+  }
+}
+
+// ============================================================================
+// Outline Extraction
+// ============================================================================
+
+/**
+ * 大纲提取功能开关
+ */
+const OUTLINE_ENABLED = true
+
+/**
+ * 上一次发送的大纲数据哈希（用于避免重复推送）
+ */
+let lastOutlineHash = ''
+
+/**
+ * 从 Typst 源码中提取标题
+ * 
+ * 支持的标题语法：
+ * - `= Title` (level 1)
+ * - `== Title` (level 2)
+ * - 以此类推到 level 6
+ * 
+ * @param source - Typst 源码
+ * @returns 标题列表
+ */
+function extractHeadings(source: string): OutlineHeading[] {
+  const headings: OutlineHeading[] = []
+  const lines = source.split('\n')
+  
+  // 简单的页面估算：假设每 60 行是一页（粗略估计）
+  const LINES_PER_PAGE = 60
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    if (!line) continue
+    
+    const trimmed = line.trim()
+    
+    // 匹配标题：以 = 开头，后跟空格和标题内容
+    const match = trimmed.match(/^(={1,6})\s+(.+)$/)
+    if (match && match[1] && match[2]) {
+      const level = match[1].length
+      const body = match[2].trim()
+      const page = Math.floor(i / LINES_PER_PAGE) + 1
+      
+      // 估算 Y 位置（基于行号）
+      const y = (i % LINES_PER_PAGE) * 12 // 假设每行 12pt
+      
+      headings.push({
+        level,
+        body,
+        page,
+        y,
+      })
+    }
+  }
+  
+  return headings
+}
+
+/**
+ * 从 Typst 源码中提取图表
+ * 
+ * 支持的语法：
+ * - `#figure(...)` 
+ * - `#figure(image(...), caption: [...])`
+ * - `#figure(table(...), caption: [...])`
+ * 
+ * @param source - Typst 源码
+ * @returns 图表列表
+ */
+function extractFigures(source: string): OutlineFigure[] {
+  const figures: OutlineFigure[] = []
+  const lines = source.split('\n')
+  
+  // 计数器
+  const counters: Record<string, number> = {
+    image: 0,
+    table: 0,
+    figure: 0,
+  }
+  
+  const LINES_PER_PAGE = 60
+  
+  // 查找每个 figure 的位置
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    if (!line) continue
+    
+    if (line.includes('#figure')) {
+      // 尝试确定 figure 类型
+      let kind = 'figure'
+      if (line.includes('image(') || line.includes('image (')) {
+        kind = 'image'
+      } else if (line.includes('table(') || line.includes('table (')) {
+        kind = 'table'
+      } else if (line.includes('raw(') || line.includes('raw (')) {
+        kind = 'raw'
+      }
+      
+      // 增加计数
+      counters[kind] = (counters[kind] || 0) + 1
+      
+      // 尝试提取 caption
+      let caption = ''
+      const captionMatch = line.match(/caption:\s*\[(.*?)\]/)
+      if (captionMatch && captionMatch[1]) {
+        caption = captionMatch[1]
+      } else {
+        // 可能 caption 在后续行
+        for (let j = i + 1; j < Math.min(i + 5, lines.length); j++) {
+          const nextLine = lines[j]
+          if (!nextLine) continue
+          
+          const captionInNextLine = nextLine.match(/caption:\s*\[(.*?)\]/)
+          if (captionInNextLine && captionInNextLine[1]) {
+            caption = captionInNextLine[1]
+            break
+          }
+          // 如果遇到闭合括号，停止搜索
+          if (nextLine.includes(')') && !nextLine.includes('#')) {
+            break
+          }
+        }
+      }
+      
+      const page = Math.floor(i / LINES_PER_PAGE) + 1
+      const y = (i % LINES_PER_PAGE) * 12
+      
+      figures.push({
+        kind,
+        caption,
+        number: counters[kind] ?? 0,
+        page,
+        y,
+      })
+    }
+  }
+  
+  return figures
+}
+
+/**
+ * 计算简单哈希
+ */
+function simpleHash(str: string): string {
+  let hash = 0
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i)
+    hash = ((hash << 5) - hash) + char
+    hash = hash & hash // Convert to 32bit integer
+  }
+  return hash.toString(36)
+}
+
+/**
+ * 从源码中提取大纲数据
+ * 
+ * @param source - Typst 源码
+ * @returns 大纲数据
+ */
+function extractOutline(source: string): OutlineData {
+  const headings = extractHeadings(source)
+  const figures = extractFigures(source)
+  
+  // 估算页数（基于内容量）
+  const lines = source.split('\n').length
+  const pageCount = Math.max(1, Math.ceil(lines / 60))
+  
+  return {
+    headings,
+    figures,
+    pageCount,
+  }
+}
+
+/**
+ * 发送大纲数据到主线程
+ * 
+ * @param requestId - 请求 ID
+ * @param source - Typst 源码
+ */
+function pushOutlineData(requestId: string, source: string): void {
+  if (!OUTLINE_ENABLED) {
+    return
+  }
+  
+  try {
+    const outline = extractOutline(source)
+    
+    // 检查是否有变化（避免重复推送）
+    const hash = simpleHash(JSON.stringify(outline))
+    if (hash === lastOutlineHash) {
+      return
+    }
+    lastOutlineHash = hash
+    
+    postResponse({
+      type: 'outline_result',
+      id: requestId,
+      payload: outline,
+    })
+  } catch (error) {
+    console.warn('[Worker] Failed to extract outline:', error)
   }
 }
 
@@ -542,10 +698,11 @@ async function handleMessage(event: MessageEvent<MainToWorkerMessage>): Promise<
             [result.artifact.buffer]
           )
 
-          // 编译成功后立即推送内省数据（异步，不阻塞响应）
+          // 编译成功后立即推送数据（异步，不阻塞响应）
           // 减少后续点击操作时的延迟
           setTimeout(() => {
             pushIntrospectionData(message.id, mainFilePath)
+            pushOutlineData(message.id, source)
           }, 0)
         } else {
           const errorMsg = result.diagnostics.find(d => d.severity === 'error')?.message
@@ -591,9 +748,10 @@ async function handleMessage(event: MessageEvent<MainToWorkerMessage>): Promise<
             [result.artifact.buffer]
           )
 
-          // 增量编译成功后也推送内省数据
+          // 增量编译成功后也推送数据
           setTimeout(() => {
             pushIntrospectionData(message.id, path)
+            pushOutlineData(message.id, content)
           }, 0)
         } else {
           const errorMsg = result.diagnostics.find(d => d.severity === 'error')?.message

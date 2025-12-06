@@ -8,6 +8,8 @@ import { useState, useEffect, useCallback, useRef, Suspense } from 'react'
 import { useTypstCompiler } from '../hooks'
 import { useDebouncedCallback } from '../utils/useDebounce'
 import { TypstPreview } from './TypstPreview'
+import { OutlinePanel } from './OutlinePanel'
+import type { OutlineHeading, OutlineFigure } from '../workers/types'
 
 // ============================================================================
 // Constants
@@ -113,6 +115,13 @@ export function TypstEditor() {
   const [artifact, setArtifact] = useState<Uint8Array | null>(null)
   const [compileTime, setCompileTime] = useState<number | null>(null)
   const [localError, setLocalError] = useState<string | null>(null)
+  
+  // 大纲面板状态
+  const [showOutline, setShowOutline] = useState(true)
+  const [currentPage, setCurrentPage] = useState(1)
+  
+  // Ref for source textarea to enable cursor positioning
+  const sourceTextareaRef = useRef<HTMLTextAreaElement>(null)
 
   // 是否使用增量编译（首次编译后启用）
   const hasCompiledOnce = useRef(false)
@@ -184,6 +193,83 @@ export function TypstEditor() {
     doCompile(source)
   }, [reset, source, doCompile])
 
+  // 切换大纲面板显示
+  const toggleOutline = useCallback(() => {
+    setShowOutline(prev => !prev)
+  }, [])
+
+  // 处理标题点击 - 跳转到源码对应位置
+  const handleHeadingClick = useCallback((heading: OutlineHeading) => {
+    // 更新当前页面（用于高亮）
+    setCurrentPage(heading.page)
+    
+    // 尝试在源码中找到对应的标题并聚焦
+    const textarea = sourceTextareaRef.current
+    if (!textarea) return
+    
+    const lines = source.split('\n')
+    const equalSigns = '='.repeat(heading.level)
+    
+    // 搜索匹配的标题行
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      if (line && line.trim().startsWith(equalSigns + ' ') && line.includes(heading.body)) {
+        // 计算字符位置
+        let charPosition = 0
+        for (let j = 0; j < i; j++) {
+          charPosition += (lines[j]?.length ?? 0) + 1 // +1 for newline
+        }
+        
+        // 聚焦并设置光标位置
+        textarea.focus()
+        textarea.setSelectionRange(charPosition, charPosition + (line?.length ?? 0))
+        
+        // 滚动到可见区域
+        const lineHeight = 20 // 估算行高
+        textarea.scrollTop = Math.max(0, i * lineHeight - textarea.clientHeight / 2)
+        
+        break
+      }
+    }
+  }, [source])
+
+  // 处理图表点击 - 跳转到源码对应位置
+  const handleFigureClick = useCallback((figure: OutlineFigure) => {
+    // 更新当前页面（用于高亮）
+    setCurrentPage(figure.page)
+    
+    const textarea = sourceTextareaRef.current
+    if (!textarea) return
+    
+    const lines = source.split('\n')
+    let figureCount = 0
+    
+    // 搜索第 N 个 figure
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      if (line && line.includes('#figure')) {
+        figureCount++
+        if (figureCount === figure.number) {
+          // 计算字符位置
+          let charPosition = 0
+          for (let j = 0; j < i; j++) {
+            charPosition += (lines[j]?.length ?? 0) + 1
+          }
+          
+          // 聚焦并设置光标位置
+          textarea.focus()
+          textarea.setSelectionRange(charPosition, charPosition + (line?.length ?? 0))
+          
+          // 滚动到可见区域
+          const lineHeight = 20
+          textarea.scrollTop = Math.max(0, i * lineHeight - textarea.clientHeight / 2)
+          
+          break
+        }
+      }
+    }
+  }, [source])
+
   const displayError = error?.message ?? localError
 
   return (
@@ -201,51 +287,63 @@ export function TypstEditor() {
         />
       )}
 
-      <div className="editor-layout">
-        {/* 源码编辑器 */}
-        <div className="editor-pane source-pane">
-          <div className="pane-header">
-            <h3>Source</h3>
-            <button 
-              className="compile-btn"
-              onClick={handleManualCompile}
-              disabled={!isReady || status === 'compiling'}
-            >
-              {status === 'compiling' ? 'Compiling...' : 'Compile'}
-            </button>
-          </div>
-          <textarea
-            className="source-textarea"
-            value={source}
-            onChange={handleSourceChange}
-            placeholder="Enter Typst source code..."
-            spellCheck={false}
-            autoCapitalize="off"
-            autoCorrect="off"
-          />
-        </div>
+      <div className="editor-layout-with-outline">
+        {/* 大纲面板 */}
+        <OutlinePanel
+          currentPage={currentPage}
+          onHeadingClick={handleHeadingClick}
+          onFigureClick={handleFigureClick}
+          isExpanded={showOutline}
+          onToggleExpand={toggleOutline}
+        />
 
-        {/* 预览区 */}
-        <div className="editor-pane preview-pane">
-          <div className="pane-header">
-            <h3>Preview</h3>
+        <div className="editor-layout">
+          {/* 源码编辑器 */}
+          <div className="editor-pane source-pane">
+            <div className="pane-header">
+              <h3>Source</h3>
+              <button 
+                className="compile-btn"
+                onClick={handleManualCompile}
+                disabled={!isReady || status === 'compiling'}
+              >
+                {status === 'compiling' ? 'Compiling...' : 'Compile'}
+              </button>
+            </div>
+            <textarea
+              ref={sourceTextareaRef}
+              className="source-textarea"
+              value={source}
+              onChange={handleSourceChange}
+              placeholder="Enter Typst source code..."
+              spellCheck={false}
+              autoCapitalize="off"
+              autoCorrect="off"
+            />
           </div>
-          <div className="preview-container">
-            {status === 'initializing' ? (
-              <LoadingOverlay message="Loading Typst Engine..." />
-            ) : status === 'compiling' && !artifact ? (
-              <LoadingOverlay message="Compiling..." />
-            ) : artifact ? (
-              <Suspense fallback={<LoadingOverlay message="Rendering..." />}>
-                <div className="preview-scroll">
-                  <TypstPreview artifact={artifact} backgroundColor="#ffffff" />
+
+          {/* 预览区 */}
+          <div className="editor-pane preview-pane">
+            <div className="pane-header">
+              <h3>Preview</h3>
+            </div>
+            <div className="preview-container">
+              {status === 'initializing' ? (
+                <LoadingOverlay message="Loading Typst Engine..." />
+              ) : status === 'compiling' && !artifact ? (
+                <LoadingOverlay message="Compiling..." />
+              ) : artifact ? (
+                <Suspense fallback={<LoadingOverlay message="Rendering..." />}>
+                  <div className="preview-scroll">
+                    <TypstPreview artifact={artifact} backgroundColor="#ffffff" />
+                  </div>
+                </Suspense>
+              ) : (
+                <div className="preview-empty">
+                  <p>Enter Typst code to see preview</p>
                 </div>
-              </Suspense>
-            ) : (
-              <div className="preview-empty">
-                <p>Enter Typst code to see preview</p>
-              </div>
-            )}
+              )}
+            </div>
           </div>
         </div>
       </div>

@@ -15,6 +15,8 @@ import type {
   CompilerState,
   IntrospectionData,
   SourceMarker,
+  OutlineData,
+  OutlineHeading,
 } from '../workers/types'
 import { FontService } from './FontService'
 
@@ -52,6 +54,11 @@ export type StatusListener = (event: WorkerStatusEvent) => void
  */
 export type IntrospectionListener = (data: IntrospectionData) => void
 
+/**
+ * 大纲数据监听器
+ */
+export type OutlineListener = (data: OutlineData) => void
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -81,6 +88,12 @@ class TypstWorkerServiceImpl {
 
   /** 最新的内省数据缓存 */
   private latestIntrospection: IntrospectionData | null = null
+
+  /** 大纲数据监听器 */
+  private outlineListeners = new Set<OutlineListener>()
+
+  /** 最新的大纲数据缓存 */
+  private latestOutline: OutlineData | null = null
 
   /** Worker 就绪 Promise */
   private workerReadyPromise: Promise<void> | null = null
@@ -175,6 +188,11 @@ class TypstWorkerServiceImpl {
         // Worker 主动推送的内省数据
         this.handleIntrospectionResult(message.payload)
         break
+
+      case 'outline_result':
+        // Worker 主动推送的大纲数据
+        this.handleOutlineResult(message.payload)
+        break
     }
   }
 
@@ -192,6 +210,24 @@ class TypstWorkerServiceImpl {
         listener(data)
       } catch (error) {
         console.error('[TypstWorkerService] Introspection listener error:', error)
+      }
+    }
+  }
+
+  /**
+   * 处理大纲数据
+   * Worker 在编译成功后主动推送，用于生成交互式大纲面板
+   */
+  private handleOutlineResult(data: OutlineData): void {
+    // 缓存最新数据
+    this.latestOutline = data
+
+    // 通知所有监听器
+    for (const listener of this.outlineListeners) {
+      try {
+        listener(data)
+      } catch (error) {
+        console.error('[TypstWorkerService] Outline listener error:', error)
       }
     }
   }
@@ -561,6 +597,118 @@ class TypstWorkerServiceImpl {
     if (!this.latestIntrospection) return []
     return this.latestIntrospection.markers.filter(m => m.page === page)
   }
+
+  // --------------------------------------------------------------------------
+  // Outline API
+  // --------------------------------------------------------------------------
+
+  /**
+   * 订阅大纲数据更新
+   * 
+   * Worker 在每次编译成功后会主动推送大纲数据（标题、图表），
+   * 通过此方法注册的监听器会收到更新通知。
+   * 
+   * @param listener - 数据更新回调
+   * @returns 取消订阅函数
+   */
+  onOutlineUpdate(listener: OutlineListener): () => void {
+    this.outlineListeners.add(listener)
+    
+    // 如果已有缓存数据，立即通知
+    if (this.latestOutline) {
+      try {
+        listener(this.latestOutline)
+      } catch (error) {
+        console.error('[TypstWorkerService] Outline listener error:', error)
+      }
+    }
+    
+    return () => {
+      this.outlineListeners.delete(listener)
+    }
+  }
+
+  /**
+   * 获取最新的大纲数据
+   * 
+   * @returns 最新的大纲数据，如果尚未编译成功则返回 null
+   */
+  getLatestOutline(): OutlineData | null {
+    return this.latestOutline
+  }
+
+  /**
+   * 查找指定页面上的所有标题
+   * 
+   * @param page - 页码（从 1 开始）
+   * @returns 该页面上的所有标题
+   */
+  findHeadingsOnPage(page: number): OutlineHeading[] {
+    if (!this.latestOutline) return []
+    return this.latestOutline.headings.filter(h => h.page === page)
+  }
+
+  /**
+   * 获取文档的标题树结构
+   * 
+   * @returns 层级化的标题树
+   */
+  getHeadingTree(): OutlineHeadingNode[] {
+    if (!this.latestOutline) return []
+    return buildHeadingTree(this.latestOutline.headings)
+  }
+}
+
+// ============================================================================
+// Helper Types and Functions
+// ============================================================================
+
+/**
+ * 大纲标题树节点
+ */
+export interface OutlineHeadingNode extends OutlineHeading {
+  /** 子标题 */
+  children: OutlineHeadingNode[]
+}
+
+/**
+ * 将平面标题列表转换为树结构
+ */
+function buildHeadingTree(headings: OutlineHeading[]): OutlineHeadingNode[] {
+  const root: OutlineHeadingNode[] = []
+  const stack: OutlineHeadingNode[] = []
+
+  for (const heading of headings) {
+    const node: OutlineHeadingNode = {
+      ...heading,
+      children: [],
+    }
+
+    // 找到合适的父节点
+    while (stack.length > 0) {
+      const parent = stack[stack.length - 1]
+      if (parent && parent.level >= heading.level) {
+        stack.pop()
+      } else {
+        break
+      }
+    }
+
+    if (stack.length === 0) {
+      // 顶级标题
+      root.push(node)
+    } else {
+      // 作为子标题添加到父节点
+      const parent = stack[stack.length - 1]
+      if (parent) {
+        parent.children.push(node)
+      }
+    }
+
+    stack.push(node)
+  }
+
+  return root
 }
 
 // ============================================================================

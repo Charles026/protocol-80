@@ -126,6 +126,66 @@ export const DEBUG_BOX_BORDER_COLORS: Record<DebugBoxType, string> = {
 }
 
 // ============================================================================
+// Outline / Semantic Extraction Types
+// ============================================================================
+
+/**
+ * 文档标题项
+ * 由 Typst query(heading) 生成
+ */
+export interface OutlineHeading {
+  /** 标题级别 (1-6) */
+  level: number
+  /** 标题文本内容 */
+  body: string
+  /** 所在页码 */
+  page: number
+  /** Y 坐标（pt），用于页面内定位 */
+  y: number
+}
+
+/**
+ * 文档图表项
+ * 由 Typst query(figure) 生成
+ */
+export interface OutlineFigure {
+  /** 图表类型 (image, table, raw 等) */
+  kind: string
+  /** 图表标题/描述 */
+  caption: string
+  /** 图表编号 */
+  number: number
+  /** 所在页码 */
+  page: number
+  /** Y 坐标（pt），用于页面内定位 */
+  y: number
+}
+
+/**
+ * 文档大纲数据
+ * 包含标题、图表等结构化信息
+ */
+export interface OutlineData {
+  /** 所有标题 */
+  headings: OutlineHeading[]
+  /** 所有图表 */
+  figures: OutlineFigure[]
+  /** 文档总页数 */
+  pageCount: number
+}
+
+/**
+ * 大纲数据响应 - 编译成功后主动推送
+ */
+export interface OutlineResponse {
+  type: 'outline_result'
+  /** 关联的编译请求 ID */
+  id: string
+  /** 大纲数据 */
+  payload: OutlineData
+}
+
+// ============================================================================
 // Font Loading Types
 // ============================================================================
 
@@ -328,6 +388,7 @@ export type WorkerToMainMessage =
   | FontRequestMessage
   | ReadyMessage
   | IntrospectionResponse
+  | OutlineResponse
 
 // ============================================================================
 // Helper Types

@@ -10,4 +10,5 @@ export {
   type DebugOverlayProps,
   type DebugControlsProps,
 } from './DebugOverlay'
+export { OutlinePanel } from './OutlinePanel'
 
