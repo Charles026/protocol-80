@@ -1,5 +1,7 @@
 import { Suspense } from 'react'
 import { TypstEditor } from './components'
+// Uncomment to test resilient worker:
+// import { TestResilientWorker } from './components/TestResilientWorker'
 
 function App() {
   return (
@@ -10,7 +12,7 @@ function App() {
           <p>Browser-based Typst Editor</p>
         </div>
       </header>
-      
+
       <main className="app-main">
         <Suspense fallback={
           <div className="global-loading">
@@ -19,6 +21,7 @@ function App() {
           </div>
         }>
           <TypstEditor />
+          {/* <TestResilientWorker /> */}
         </Suspense>
       </main>
     </div>
@@ -26,3 +29,4 @@ function App() {
 }
 
 export default App
+
