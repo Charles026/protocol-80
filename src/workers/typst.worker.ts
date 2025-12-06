@@ -76,17 +76,68 @@ function estimatePageCount(size: number): number {
 
 /**
  * Extract plain text from Typst content (recursive)
+ * 
+ * Typst query results can have various structures:
+ * - Direct string: "Hello"
+ * - Text object: { text: "Hello" }
+ * - Body wrapper: { body: ... }
+ * - Children array: { children: [...] }
+ * - Sequence: { func: "sequence", children: [...] }
+ * - Content array: [...]
  */
 function extractTextContent(content: unknown): string {
   if (!content) return ''
   if (typeof content === 'string') return content
+  if (typeof content === 'number') return String(content)
+
   if (typeof content === 'object' && content !== null) {
-    if ('text' in content) return String((content as { text: unknown }).text)
+    const obj = content as Record<string, unknown>
+
+    // Try common text fields
+    if ('text' in obj && typeof obj.text === 'string') {
+      return obj.text
+    }
+
+    // Try body field (common in heading results)
+    if ('body' in obj) {
+      return extractTextContent(obj.body)
+    }
+
+    // Try children array (Typst sequence)
+    if ('children' in obj && Array.isArray(obj.children)) {
+      return obj.children.map(extractTextContent).join('')
+    }
+
+    // Try content field
+    if ('content' in obj) {
+      return extractTextContent(obj.content)
+    }
+
+    // Try value field
+    if ('value' in obj) {
+      return extractTextContent(obj.value)
+    }
+
+    // Handle arrays
     if (Array.isArray(content)) {
       return content.map(extractTextContent).join('')
     }
+
+    // Last resort: try to get any string-like property
+    const stringValue = Object.values(obj).find(v => typeof v === 'string')
+    if (stringValue) return stringValue as string
+
+    // If nothing worked, try to extract from nested objects
+    for (const value of Object.values(obj)) {
+      if (typeof value === 'object' && value !== null) {
+        const extracted = extractTextContent(value)
+        if (extracted) return extracted
+      }
+    }
   }
-  return String(content)
+
+  // Fallback - don't return [object Object]
+  return ''
 }
 
 // ============================================================================
@@ -116,71 +167,20 @@ async function initCompiler(): Promise<void> {
   }
 }
 
-/**
- * Extract outline data and send to main thread using unified protocol
- */
-async function extractAndSendOutline(requestId: string, mainFilePath: string): Promise<void> {
-  if (!compiler) return
-
-  try {
-    // Query headings with type-safe casting
-    const headingsRaw = await compiler.query({ 
-      selector: 'heading', 
-      mainFilePath 
-    }) as TypstHeadingQueryResult[]
-
-    const headings: OutlineHeading[] = (headingsRaw ?? []).map((h) => ({
-      level: h.level ?? 1,
-      body: extractTextContent(h.body),
-      page: h.location?.page ?? 1,
-      y: h.location?.position?.y ?? 0,
-    }))
-
-    // Query figures with type-safe casting
-    const figuresRaw = await compiler.query({ 
-      selector: 'figure', 
-      mainFilePath 
-    }) as TypstFigureQueryResult[]
-
-    const figures: OutlineFigure[] = (figuresRaw ?? []).map((f, idx) => ({
-      kind: f.kind ?? 'image',
-      caption: extractTextContent(f.caption?.body),
-      number: idx + 1,
-      page: f.location?.page ?? 1,
-      y: f.location?.position?.y ?? 0,
-    }))
-
-    // Estimate page count from max page in headings/figures
-    const maxPage = Math.max(
-      1,
-      ...headings.map((h) => h.page),
-      ...figures.map((f) => f.page)
-    )
-
-    // Send outline using unified protocol (kind discriminator)
-    postMessage({
-      kind: 'OUTLINE_RESULT',
-      requestId,
-      payload: {
-        headings,
-        figures,
-        pageCount: maxPage,
-      },
-    })
-  } catch (err) {
-    console.warn('[Worker] Outline query failed:', err)
-  }
-}
+// Note: Outline extraction is now integrated into runCompile using runWithWorld API
 
 /**
  * Compile Typst source code
+ * 
+ * Uses runWithWorld to execute compile and query in the same world context.
+ * This is required because query() needs access to the compiled document state.
  */
 async function runCompile(
   requestId: string,
-  payload: { 
+  payload: {
     source: string
     mainFilePath: string
-    format?: 'vector' | 'pdf' 
+    format?: 'vector' | 'pdf'
   }
 ): Promise<void> {
   if (!compiler) {
@@ -192,49 +192,118 @@ async function runCompile(
   try {
     compiler.resetShadow()
     compiler.addSource(payload.mainFilePath, payload.source)
-    
-    const result = await compiler.compile({
-      mainFilePath: payload.mainFilePath,
-      format: payload.format === 'pdf' ? 1 : 0,
-      diagnostics: 'full',
-    })
+
+    // Use runWithWorld to compile and query in the same world context
+    const result = await compiler.runWithWorld(
+      {
+        root: '/',
+        mainFilePath: payload.mainFilePath,
+      },
+      async (world) => {
+        // Step 1: Compile the document
+        const compileResult = await world.vector({ diagnostics: 'full' })
+        const artifact = compileResult.result as Uint8Array | null
+        const diagnostics = (compileResult.diagnostics ?? []) as DiagnosticInfo[]
+
+        if (!artifact) {
+          return { artifact: null, diagnostics, headings: [] as OutlineHeading[], figures: [] as OutlineFigure[], pageCount: 1 }
+        }
+
+        // Step 2: Query headings in the same world context
+        let headings: OutlineHeading[] = []
+        try {
+          const headingsRaw = await world.query({ selector: 'heading' }) as TypstHeadingQueryResult[]
+
+          headings = (headingsRaw ?? []).map((h) => {
+            // Try multiple location paths - Typst query returns vary by version
+            const rawH = h as Record<string, unknown>
+            const loc = (h.location ?? rawH.loc ?? rawH.position ?? {}) as Record<string, unknown>
+            const page = (loc.page ?? loc.p ?? 1) as number
+            const y = ((loc.position as Record<string, unknown>)?.y ?? loc.y ?? 0) as number
+
+            return {
+              level: h.level ?? 1,
+              body: extractTextContent(h.body),
+              page,
+              y,
+            }
+          })
+          console.log(`[Worker] Extracted ${headings.length} headings`)
+        } catch (err) {
+          console.warn('[Worker] Heading query failed:', err)
+        }
+
+        // Step 3: Query figures in the same world context
+        let figures: OutlineFigure[] = []
+        try {
+          const figuresRaw = await world.query({ selector: 'figure' }) as TypstFigureQueryResult[]
+          figures = (figuresRaw ?? []).map((f, idx) => {
+            const rawF = f as Record<string, unknown>
+            const loc = (f.location ?? rawF.loc ?? rawF.position ?? {}) as Record<string, unknown>
+            const page = (loc.page ?? loc.p ?? 1) as number
+            const y = ((loc.position as Record<string, unknown>)?.y ?? loc.y ?? 0) as number
+
+            return {
+              kind: f.kind ?? 'image',
+              caption: extractTextContent(f.caption?.body),
+              number: idx + 1,
+              page,
+              y,
+            }
+          })
+          console.log(`[Worker] Extracted ${figures.length} figures`)
+        } catch (err) {
+          console.warn('[Worker] Figure query failed:', err)
+        }
+
+        // Estimate page count from max page in headings/figures
+        const pageCount = Math.max(
+          1,
+          ...headings.map((h) => h.page),
+          ...figures.map((f) => f.page)
+        )
+
+        return { artifact, diagnostics, headings, figures, pageCount }
+      }
+    )
 
     const duration = performance.now() - start
     perfStats.compileCount++
     perfStats.lastDuration = duration
 
-    const diagnostics = (result.diagnostics ?? []) as DiagnosticInfo[]
-    const artifact = result.result as Uint8Array | null
-
-    if (artifact) {
+    if (result.artifact) {
       // ✅ Happy Path: Zero-Copy Transfer
       postMessage(
         {
           kind: 'COMPILE_SUCCESS',
           requestId,
-          artifact,
+          artifact: result.artifact,
           timing: duration,
-          diagnostics,
+          diagnostics: result.diagnostics,
         },
-        [artifact.buffer] // Transfer ownership for zero-copy
+        [result.artifact.buffer] // Transfer ownership for zero-copy
       )
 
       // Async health report (non-blocking)
-      reportHealth(artifact.byteLength)
+      reportHealth(result.artifact.byteLength)
 
-      // Extract and send outline data
-      try {
-        await extractAndSendOutline(requestId, payload.mainFilePath)
-      } catch (outlineErr) {
-        console.warn('[Worker] Failed to extract outline:', outlineErr)
-      }
+      // Send outline data (already extracted in world context)
+      postMessage({
+        kind: 'OUTLINE_RESULT',
+        requestId,
+        payload: {
+          headings: result.headings,
+          figures: result.figures,
+          pageCount: result.pageCount
+        },
+      })
     } else {
       // Compilation logic error (e.g., syntax error), not a Worker crash
       postMessage({
         kind: 'COMPILE_ERROR',
         requestId,
         error: 'Compilation produced no output',
-        diagnostics,
+        diagnostics: result.diagnostics,
       })
     }
   } catch (err) {
@@ -283,8 +352,8 @@ function reportHealth(lastArtifactSize: number): void {
  */
 function getMemoryUsage(): number {
   // Chrome-specific API
-  const perf = performance as Performance & { 
-    memory?: { usedJSHeapSize?: number } 
+  const perf = performance as Performance & {
+    memory?: { usedJSHeapSize?: number }
   }
   return perf.memory?.usedJSHeapSize ?? 0
 }
@@ -295,8 +364,8 @@ function getMemoryUsage(): number {
 function dispose(): void {
   if (compiler) {
     // Type-safe dispose check
-    const disposableCompiler = compiler as TypstCompiler & { 
-      dispose?: () => void 
+    const disposableCompiler = compiler as TypstCompiler & {
+      dispose?: () => void
     }
     if (typeof disposableCompiler.dispose === 'function') {
       disposableCompiler.dispose()
