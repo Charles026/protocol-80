@@ -167,13 +167,15 @@ async function initCompiler(): Promise<void> {
   }
 }
 
-// Note: Outline extraction is now integrated into runCompile using runWithWorld API
+// Note: Outline extraction temporarily disabled to fix stability issues
 
 /**
  * Compile Typst source code
  * 
- * Uses runWithWorld to execute compile and query in the same world context.
- * This is required because query() needs access to the compiled document state.
+ * STABILITY FIX: Using direct compile() API instead of runWithWorld
+ * which was causing crashes on large documents (50+ pages).
+ * 
+ * Outline extraction is temporarily disabled and will send empty data.
  */
 async function runCompile(
   requestId: string,
@@ -193,108 +195,45 @@ async function runCompile(
     compiler.resetShadow()
     compiler.addSource(payload.mainFilePath, payload.source)
 
-    // Use runWithWorld to compile and query in the same world context
-    const result = await compiler.runWithWorld(
-      {
-        root: '/',
-        mainFilePath: payload.mainFilePath,
-      },
-      async (world) => {
-        // Step 1: Compile the document
-        const compileResult = await world.vector({ diagnostics: 'full' })
-        const artifact = compileResult.result as Uint8Array | null
-        const diagnostics = (compileResult.diagnostics ?? []) as DiagnosticInfo[]
-
-        if (!artifact) {
-          return { artifact: null, diagnostics, headings: [] as OutlineHeading[], figures: [] as OutlineFigure[], pageCount: 1 }
-        }
-
-        // Step 2: Query headings in the same world context
-        let headings: OutlineHeading[] = []
-        try {
-          const headingsRaw = await world.query({ selector: 'heading' }) as TypstHeadingQueryResult[]
-
-          headings = (headingsRaw ?? []).map((h) => {
-            // Try multiple location paths - Typst query returns vary by version
-            const rawH = h as Record<string, unknown>
-            const loc = (h.location ?? rawH.loc ?? rawH.position ?? {}) as Record<string, unknown>
-            const page = (loc.page ?? loc.p ?? 1) as number
-            const y = ((loc.position as Record<string, unknown>)?.y ?? loc.y ?? 0) as number
-
-            return {
-              level: h.level ?? 1,
-              body: extractTextContent(h.body),
-              page,
-              y,
-            }
-          })
-          console.log(`[Worker] Extracted ${headings.length} headings`)
-        } catch (err) {
-          console.warn('[Worker] Heading query failed:', err)
-        }
-
-        // Step 3: Query figures in the same world context
-        let figures: OutlineFigure[] = []
-        try {
-          const figuresRaw = await world.query({ selector: 'figure' }) as TypstFigureQueryResult[]
-          figures = (figuresRaw ?? []).map((f, idx) => {
-            const rawF = f as Record<string, unknown>
-            const loc = (f.location ?? rawF.loc ?? rawF.position ?? {}) as Record<string, unknown>
-            const page = (loc.page ?? loc.p ?? 1) as number
-            const y = ((loc.position as Record<string, unknown>)?.y ?? loc.y ?? 0) as number
-
-            return {
-              kind: f.kind ?? 'image',
-              caption: extractTextContent(f.caption?.body),
-              number: idx + 1,
-              page,
-              y,
-            }
-          })
-          console.log(`[Worker] Extracted ${figures.length} figures`)
-        } catch (err) {
-          console.warn('[Worker] Figure query failed:', err)
-        }
-
-        // Estimate page count from max page in headings/figures
-        const pageCount = Math.max(
-          1,
-          ...headings.map((h) => h.page),
-          ...figures.map((f) => f.page)
-        )
-
-        return { artifact, diagnostics, headings, figures, pageCount }
-      }
-    )
+    // Use direct compile() API for stability
+    const result = await compiler.compile({
+      mainFilePath: payload.mainFilePath,
+      format: payload.format === 'pdf' ? 1 : 0,
+      diagnostics: 'full',
+    })
 
     const duration = performance.now() - start
     perfStats.compileCount++
     perfStats.lastDuration = duration
 
-    if (result.artifact) {
+    const diagnostics = (result.diagnostics ?? []) as DiagnosticInfo[]
+    const artifact = result.result as Uint8Array | null
+
+    if (artifact) {
       // ✅ Happy Path: Zero-Copy Transfer
       postMessage(
         {
           kind: 'COMPILE_SUCCESS',
           requestId,
-          artifact: result.artifact,
+          artifact,
           timing: duration,
-          diagnostics: result.diagnostics,
+          diagnostics,
         },
-        [result.artifact.buffer] // Transfer ownership for zero-copy
+        [artifact.buffer] // Transfer ownership for zero-copy
       )
 
       // Async health report (non-blocking)
-      reportHealth(result.artifact.byteLength)
+      reportHealth(artifact.byteLength)
 
-      // Send outline data (already extracted in world context)
+      // Send empty outline for now (query disabled for stability)
+      // TODO: Re-enable outline extraction in Phase 2 with proper memory management
       postMessage({
         kind: 'OUTLINE_RESULT',
         requestId,
         payload: {
-          headings: result.headings,
-          figures: result.figures,
-          pageCount: result.pageCount
+          headings: [],
+          figures: [],
+          pageCount: estimatePageCount(artifact.byteLength),
         },
       })
     } else {
@@ -303,7 +242,7 @@ async function runCompile(
         kind: 'COMPILE_ERROR',
         requestId,
         error: 'Compilation produced no output',
-        diagnostics: result.diagnostics,
+        diagnostics,
       })
     }
   } catch (err) {

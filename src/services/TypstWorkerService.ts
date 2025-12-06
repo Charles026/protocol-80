@@ -306,6 +306,11 @@ class TypstWorkerServiceImpl {
         this.handleOutlineResult(message.payload)
         return
 
+      case 'PROBE_RESULT':
+        // Probe data handled by IntrospectionService
+        // TODO: Wire up probe data notification
+        return
+
       default:
         // Exhaustiveness check - TypeScript will error if we miss a case
         assertNever(message, `[TypstWorkerService] Unknown message kind: ${(message as { kind: string }).kind}`)
@@ -824,7 +829,7 @@ class TypstWorkerServiceImpl {
 
     try {
       const requestId = this.generateRequestId()
-      
+
       const result = await this.sendCompileRequest(requestId, {
         kind: 'COMPILE',
         source,
@@ -856,7 +861,7 @@ class TypstWorkerServiceImpl {
 
     try {
       const requestId = this.generateRequestId()
-      
+
       // Use COMPILE message for incremental updates
       return await this.sendCompileRequest(requestId, {
         kind: 'COMPILE',
@@ -1173,3 +1178,32 @@ export const TypstWorkerService = new TypstWorkerServiceImpl()
 
 export default TypstWorkerService
 
+// ============================================================================
+// Debug Interface (Development Only)
+// ============================================================================
+
+/**
+ * Expose debug interface for Phoenix Protocol testing
+ * Usage in console:
+ *   window.__DEBUG_TYPST__.terminateWorker()  // Kill worker
+ *   window.__DEBUG_TYPST__.getStatus()        // Check status
+ */
+if (typeof window !== 'undefined' && import.meta.env.DEV) {
+  (window as unknown as Record<string, unknown>).__DEBUG_TYPST__ = {
+    terminateWorker: () => {
+      console.log('[DEBUG] Forcefully terminating worker...')
+      // Access private worker via any cast
+      const service = TypstWorkerService as unknown as { worker: Worker | null }
+      if (service.worker) {
+        service.worker.terminate()
+        console.log('[DEBUG] Worker terminated. Phoenix Protocol should activate.')
+      } else {
+        console.warn('[DEBUG] No worker instance found')
+      }
+    },
+    getStatus: () => TypstWorkerService.getStatus(),
+    getCircuitState: () => TypstWorkerService.getCircuitState(),
+    triggerRestart: () => TypstWorkerService.manualSoftRestart('Debug test'),
+  }
+  console.log('[DEBUG] Typst debug interface loaded: window.__DEBUG_TYPST__')
+}

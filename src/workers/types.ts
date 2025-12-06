@@ -34,6 +34,7 @@ export type {
   HeartbeatAckMessage,
   ResetSuccessMessage,
   OutlineResultMessage,
+  ProbeResultMessage,
   
   // Supporting Types
   DiagnosticInfo,
@@ -45,6 +46,18 @@ export type {
   OutlineHeading,
   OutlineFigure,
   OutlineData,
+  
+  // Probe Types (Protocol 80 MVP)
+  ProbeLocation,
+  ProbeType,
+  ProbeAnchor,
+  ProbeEdge,
+  ProbeBase,
+  GeoProbe,
+  StructProbe,
+  SemanticProbe,
+  Probe,
+  ProbeData,
 } from '../types/bridge.d'
 
 // Re-export utility functions
@@ -54,6 +67,10 @@ export {
   isPanic,
   isHeartbeatAck,
   isOutlineResult,
+  isProbeResult,
+  isGeoProbe,
+  isStructProbe,
+  isSemanticProbe,
   sendToWorker,
   postWorkerResponse,
   WorkerCrashedError,

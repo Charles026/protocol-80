@@ -96,6 +96,118 @@ export interface OutlineData {
 }
 
 // ============================================================================
+// Source Probe Types (Protocol 80 MVP)
+// ============================================================================
+
+/**
+ * Physical location in Typst document
+ * Coordinates are in Points (pt), where 1 inch = 72 pt
+ */
+export interface ProbeLocation {
+    /** Page number (1-based) */
+    readonly page: number
+    /** X coordinate in points from page left edge */
+    readonly x: number
+    /** Y coordinate in points from page top edge */
+    readonly y: number
+}
+
+/**
+ * Probe type discriminator
+ * - geo: Physical coordinate markers
+ * - struct: Logical structure boundaries
+ * - semantic: AI-generated metadata
+ */
+export type ProbeType = 'geo' | 'struct' | 'semantic'
+
+/**
+ * Anchor type for geo probes
+ * - point: Single position marker
+ * - start: Beginning of a region
+ * - end: End of a region
+ */
+export type ProbeAnchor = 'point' | 'start' | 'end'
+
+/**
+ * Edge type for struct probes
+ */
+export type ProbeEdge = 'start' | 'end'
+
+/**
+ * Base probe interface - common fields for all probe types
+ */
+export interface ProbeBase {
+    /** Probe type discriminator */
+    readonly type: ProbeType
+    /** Unique identifier (UUID v4 or "L{line}-C{col}" format) */
+    readonly id: string
+    /** Physical location (populated at layout time) */
+    readonly loc: ProbeLocation
+    /** Sequence number for ordering */
+    readonly seq: number
+    /** Protocol version */
+    readonly _v: string
+}
+
+/**
+ * Geo Probe - Physical coordinate marker
+ * Used for RAG, visual highlighting, click-to-source mapping
+ */
+export interface GeoProbe extends ProbeBase {
+    readonly type: 'geo'
+    /** Anchor semantics */
+    readonly anchor: ProbeAnchor
+    /** Optional tags for filtering */
+    readonly tags?: readonly string[]
+}
+
+/**
+ * Struct Probe - Logical structure boundary marker
+ * Used for outline generation, section navigation
+ */
+export interface StructProbe extends ProbeBase {
+    readonly type: 'struct'
+    /** Structure kind (section, chapter, heading, figure, etc.) */
+    readonly kind: string
+    /** Hierarchical level (1 for h1, 2 for h2, etc.) */
+    readonly level: number
+    /** Boundary edge */
+    readonly edge: ProbeEdge
+    /** Optional title/label */
+    readonly title?: string
+}
+
+/**
+ * Semantic Probe - AI metadata injection
+ * Used for audit trails, generation tracking
+ */
+export interface SemanticProbe extends ProbeBase {
+    readonly type: 'semantic'
+    /** Arbitrary metadata payload */
+    readonly data: Record<string, unknown>
+}
+
+/**
+ * Union type for all probe types
+ */
+export type Probe = GeoProbe | StructProbe | SemanticProbe
+
+/**
+ * Probe data collection
+ * Returned by probe query after compilation
+ */
+export interface ProbeData {
+    /** Protocol version */
+    readonly version: string
+    /** Total probe count */
+    readonly count: number
+    /** All probes in document order */
+    readonly probes: readonly Probe[]
+    /** Document total page count */
+    readonly pageCount?: number
+}
+
+// ============================================================================
 // Inbound Messages (Main Thread → Worker)
 // ============================================================================
 
@@ -245,6 +357,18 @@ export interface OutlineResultMessage {
 }
 
 /**
+ * Source Probe extraction result
+ * Sent after successful compilation with embedded probe data
+ */
+export interface ProbeResultMessage {
+    readonly kind: 'PROBE_RESULT'
+    /** Match to original compile request */
+    readonly requestId: string
+    /** Probe data payload */
+    readonly payload: ProbeData
+}
+
+/**
  * Discriminated union of all outbound message types
  */
 export type WorkerToMainMessage =
@@ -255,6 +379,7 @@ export type WorkerToMainMessage =
     | HeartbeatAckMessage
     | ResetSuccessMessage
     | OutlineResultMessage
+    | ProbeResultMessage
 
 // ============================================================================
 // Supporting Types
@@ -360,6 +485,34 @@ export function isHeartbeatAck(msg: WorkerToMainMessage): msg is HeartbeatAckMes
  */
 export function isOutlineResult(msg: WorkerToMainMessage): msg is OutlineResultMessage {
     return msg.kind === 'OUTLINE_RESULT'
+}
+
+/**
+ * Check if a message is a probe result
+ */
+export function isProbeResult(msg: WorkerToMainMessage): msg is ProbeResultMessage {
+    return msg.kind === 'PROBE_RESULT'
+}
+
+/**
+ * Type guard for GeoProbe
+ */
+export function isGeoProbe(probe: Probe): probe is GeoProbe {
+    return probe.type === 'geo'
+}
+
+/**
+ * Type guard for StructProbe
+ */
+export function isStructProbe(probe: Probe): probe is StructProbe {
+    return probe.type === 'struct'
+}
+
+/**
+ * Type guard for SemanticProbe
+ */
+export function isSemanticProbe(probe: Probe): probe is SemanticProbe {
+    return probe.type === 'semantic'
 }
 
 // ============================================================================

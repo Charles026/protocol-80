@@ -223,6 +223,11 @@ export function useResilientWorker(): UseResilientWorkerReturn {
                 // This hook focuses on compilation lifecycle
                 return
 
+            case 'PROBE_RESULT':
+                // Probe data is handled by IntrospectionService
+                // This hook focuses on compilation lifecycle
+                return
+
             default:
                 // Exhaustiveness check - TypeScript will error if we miss a case
                 assertNever(message, `[useResilientWorker] Unknown message kind: ${(message as { kind: string }).kind}`)

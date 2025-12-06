@@ -30,6 +30,39 @@ export type {
   HealthListener,
 } from './WorkerHealthMonitor'
 
+// IntrospectionService (Protocol 80 MVP)
+export {
+  IntrospectionService,
+  createIntrospectionService,
+  introspectionService,
+} from './IntrospectionService'
+export type {
+  ProbeQueryOptions,
+  ProbeBoundingBox,
+  StructureNode,
+} from './IntrospectionService'
+
+// Re-export Probe types from bridge
+export type {
+  ProbeLocation,
+  ProbeType,
+  ProbeAnchor,
+  ProbeEdge,
+  ProbeBase,
+  GeoProbe,
+  StructProbe,
+  SemanticProbe,
+  Probe,
+  ProbeData,
+} from '../types/bridge.d'
+
+export {
+  isGeoProbe,
+  isStructProbe,
+  isSemanticProbe,
+  isProbeResult,
+} from '../types/bridge.d'
+
 // Re-export introspection types from workers/types
 export type {
   TypstLocation,

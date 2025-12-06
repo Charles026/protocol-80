@@ -24,6 +24,19 @@ export {
   type CompileOptions,
 } from './useResilientWorker'
 
+// Introspection hooks (Protocol 80 MVP)
+export {
+  useIntrospection,
+  useGeoProbes,
+  useStructProbes,
+  useSemanticProbes,
+  useStructureTree,
+  useHeadings,
+  usePageProbes,
+  type UseIntrospectionOptions,
+  type UseIntrospectionResult,
+} from './useIntrospection'
+
 // Re-export CompileResult from services for backwards compatibility
 export type { CompileResult } from '../services'
 
