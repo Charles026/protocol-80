@@ -938,7 +938,9 @@ async function handleMessage(event: MessageEvent<MainToWorkerMessage>): Promise<
     }
 
     default: {
-      console.warn('[Worker] Unknown message type:', (message as { type: string }).type)
+      // Exhaustiveness check - TypeScript will error if new message type is added but not handled
+      const _exhaustive: never = message
+      console.error('[Worker] Unhandled message type:', (_exhaustive as { type: string }).type)
     }
   }
 }
@@ -1083,5 +1085,23 @@ postResponse({ type: 'ready' })
 
 // Also send READY via bridge protocol
 self.postMessage({ kind: 'READY' })
+
+// ============================================================================
+// HMR Support - Clean shutdown on hot module replacement
+// ============================================================================
+
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    console.log('[Worker] HMR dispose - cleaning up...')
+    disposeCompiler()
+    // Note: self.close() would immediately terminate, but we want graceful cleanup
+    // The main thread will terminate us after receiving the dispose acknowledgment
+  })
+
+  import.meta.hot.accept(() => {
+    console.log('[Worker] HMR accept - worker module updated')
+  })
+}
+
 
 

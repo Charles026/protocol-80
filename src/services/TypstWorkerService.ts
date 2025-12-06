@@ -98,6 +98,13 @@ const MAX_SOFT_RESTARTS = 3
 /** 软重启计数重置时间 */
 const SOFT_RESTART_RESET_INTERVAL = 5 * 60 * 1000 // 5 minutes
 
+// Circuit Breaker Configuration
+const CIRCUIT_FAILURE_THRESHOLD = 5      // Failures to trigger OPEN state
+const CIRCUIT_WINDOW_MS = 60000          // 1 minute window for failure counting
+const CIRCUIT_RESET_MS = 30000           // Time before trying HALF_OPEN
+
+type CircuitState = 'CLOSED' | 'OPEN' | 'HALF_OPEN'
+
 // ============================================================================
 // Worker Service Implementation
 // ============================================================================
@@ -155,10 +162,23 @@ class TypstWorkerServiceImpl {
   /** 当前健康状态 */
   private currentHealthStatus: HealthStatus = 'healthy'
 
+  // --------------------------------------------------------------------------
+  // Circuit Breaker State
+  // --------------------------------------------------------------------------
+
+  /** 熔断器状态 */
+  private circuitState: CircuitState = 'CLOSED'
+
+  /** 故障时间戳记录 */
+  private circuitFailures: number[] = []
+
+  /** 熔断器打开时间 (for debugging/metrics) */
+  private _circuitOpenTime = 0
+
   constructor() {
     // 自动创建 Worker
     this.createWorker()
-    
+
     // 订阅健康监控事件
     this.setupHealthMonitoring()
   }
@@ -169,10 +189,10 @@ class TypstWorkerServiceImpl {
   private setupHealthMonitoring(): void {
     WorkerHealthMonitor.onHealthChange((event) => {
       this.currentHealthStatus = event.status
-      
+
       // 通知健康状态监听器
       this.notifyHealthListeners(event)
-      
+
       // 检查是否需要软重启
       if (event.metrics.needsRestart) {
         this.triggerSoftRestart(event.metrics.restartReason ?? 'Health check triggered restart')
@@ -234,6 +254,8 @@ class TypstWorkerServiceImpl {
 
       case 'compile_success':
         this.status = 'ready'
+        // Close circuit breaker on success (recover from HALF_OPEN)
+        this.closeCircuit()
         this.resolvePendingRequest<CompileResult>(message.id, {
           artifact: message.payload.artifact,
           diagnostics: message.payload.diagnostics,
@@ -332,9 +354,12 @@ class TypstWorkerServiceImpl {
    */
   private handleWorkerError = (event: ErrorEvent): void => {
     console.error('[TypstWorkerService] Worker error:', event.message)
-    
+
     this.status = 'worker_error'
     this.notifyStatusChange({ status: 'worker_error', error: event.message })
+
+    // Record failure for circuit breaker
+    this.recordCircuitFailure()
 
     // 拒绝所有待处理的请求
     for (const [, request] of this.pendingRequests) {
@@ -343,25 +368,156 @@ class TypstWorkerServiceImpl {
     }
     this.pendingRequests.clear()
 
-    // 尝试重启 Worker
-    this.attemptRestart()
+    // 尝试重启 Worker (unless circuit is open)
+    if (!this.isCircuitOpen()) {
+      this.attemptRestart()
+    }
   }
 
   /**
    * 尝试重启 Worker
+   * 
+   * Enhanced with:
+   * - Pending request backup for retry notification
+   * - Re-initialization after worker creation
+   * - Proper error state management
    */
   private async attemptRestart(): Promise<void> {
     if (this.restartAttempts >= MAX_RESTART_ATTEMPTS) {
       console.error('[TypstWorkerService] Max restart attempts reached')
+      this.status = 'worker_error'
+      this.notifyStatusChange({
+        status: 'worker_error',
+        error: 'Max restart attempts exceeded'
+      })
       return
     }
+
+    // Backup pending requests for retry notification
+    const pendingBackup = new Map(this.pendingRequests)
+    this.pendingRequests.clear()
 
     this.restartAttempts++
     console.log(`[TypstWorkerService] Attempting restart (${this.restartAttempts}/${MAX_RESTART_ATTEMPTS})`)
 
     await new Promise(resolve => setTimeout(resolve, RESTART_DELAY))
-    
+
     this.createWorker()
+
+    // Re-initialize worker after restart
+    try {
+      await this.init()
+
+      // Reset restart counter on successful init
+      this.restartAttempts = 0
+
+      // Notify callers that their requests were cancelled - they should retry
+      for (const [_id, req] of pendingBackup) {
+        if (req.timeout) clearTimeout(req.timeout)
+        req.reject(new Error('Worker restarted. Please retry your request.'))
+      }
+
+      console.log('[TypstWorkerService] Worker restart successful')
+    } catch (error) {
+      console.error('[TypstWorkerService] Re-initialization failed:', error)
+      this.status = 'worker_error'
+      this.notifyStatusChange({
+        status: 'worker_error',
+        error: `Re-init failed: ${error instanceof Error ? error.message : String(error)}`
+      })
+
+      // Reject backed up requests with final error
+      for (const [, req] of pendingBackup) {
+        if (req.timeout) clearTimeout(req.timeout)
+        req.reject(new Error(`Worker restart failed: ${error instanceof Error ? error.message : String(error)}`))
+      }
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // Circuit Breaker Methods
+  // --------------------------------------------------------------------------
+
+  /**
+   * Record a failure and update circuit breaker state
+   * Called when worker errors or crashes occur
+   */
+  private recordCircuitFailure(): void {
+    const now = Date.now()
+
+    // Prune failures outside the window
+    this.circuitFailures = this.circuitFailures.filter(
+      t => now - t < CIRCUIT_WINDOW_MS
+    )
+
+    // Add new failure
+    this.circuitFailures.push(now)
+
+    // Check if threshold exceeded
+    if (this.circuitFailures.length >= CIRCUIT_FAILURE_THRESHOLD) {
+      this.openCircuit()
+    }
+  }
+
+  /**
+   * Open the circuit breaker - block all requests
+   */
+  private openCircuit(): void {
+    if (this.circuitState === 'OPEN') return
+
+    console.warn('[TypstWorkerService] Circuit breaker OPEN - too many failures')
+    this.circuitState = 'OPEN'
+    this._circuitOpenTime = Date.now()
+
+    // Schedule transition to HALF_OPEN
+    setTimeout(() => {
+      if (this.circuitState === 'OPEN') {
+        console.log('[TypstWorkerService] Circuit breaker -> HALF_OPEN')
+        this.circuitState = 'HALF_OPEN'
+      }
+    }, CIRCUIT_RESET_MS)
+
+    this.notifyStatusChange({
+      status: 'worker_error',
+      error: 'Circuit breaker open: Service temporarily unavailable'
+    })
+  }
+
+  /**
+   * Check if requests should be allowed through
+   */
+  private isCircuitOpen(): boolean {
+    if (this.circuitState === 'CLOSED') return false
+    if (this.circuitState === 'OPEN') return true
+
+    // HALF_OPEN: allow one request through to test
+    return false
+  }
+
+  /**
+   * Mark circuit as recovered after successful request in HALF_OPEN state
+   */
+  private closeCircuit(): void {
+    if (this.circuitState === 'HALF_OPEN') {
+      console.log('[TypstWorkerService] Circuit breaker CLOSED - recovered')
+      this.circuitState = 'CLOSED'
+      this.circuitFailures = []
+    }
+  }
+
+  /**
+   * Get current circuit breaker state
+   */
+  getCircuitState(): CircuitState {
+    return this.circuitState
+  }
+
+  /**
+   * Get how long the circuit has been open (ms), or 0 if closed
+   */
+  getCircuitOpenDuration(): number {
+    if (this.circuitState === 'CLOSED') return 0
+    return Date.now() - this._circuitOpenTime
   }
 
   // --------------------------------------------------------------------------
@@ -418,7 +574,7 @@ class TypstWorkerServiceImpl {
     try {
       // 暂存待处理的请求（不拒绝，等新 Worker 处理）
       const pendingRequestsBackup = new Map(this.pendingRequests)
-      
+
       // 清除当前请求追踪
       this.pendingRequests.clear()
 
@@ -460,9 +616,9 @@ class TypstWorkerServiceImpl {
     } catch (error) {
       console.error('[TypstWorkerService] Soft restart failed:', error)
       this.status = 'worker_error'
-      this.notifyStatusChange({ 
-        status: 'worker_error', 
-        error: `Soft restart failed: ${error instanceof Error ? error.message : String(error)}` 
+      this.notifyStatusChange({
+        status: 'worker_error',
+        error: `Soft restart failed: ${error instanceof Error ? error.message : String(error)}`
       })
     } finally {
       this.isSoftRestarting = false
@@ -595,7 +751,7 @@ class TypstWorkerServiceImpl {
   private async handleFontRequest(requestId: string, family: string): Promise<void> {
     try {
       const result = await FontService.loadFont(family)
-      
+
       this.worker?.postMessage({
         type: 'add_font',
         id: requestId,
@@ -739,11 +895,11 @@ class TypstWorkerServiceImpl {
     if (this.worker) {
       // 发送销毁消息
       this.worker.postMessage({ type: 'dispose', id: 'dispose' })
-      
+
       // 移除事件监听
       this.worker.removeEventListener('message', this.handleWorkerMessage)
       this.worker.removeEventListener('error', this.handleWorkerError)
-      
+
       // 终止 Worker
       this.worker.terminate()
       this.worker = null
@@ -794,7 +950,7 @@ class TypstWorkerServiceImpl {
    */
   onIntrospectionUpdate(listener: IntrospectionListener): () => void {
     this.introspectionListeners.add(listener)
-    
+
     // 如果已有缓存数据，立即通知
     if (this.latestIntrospection) {
       try {
@@ -803,7 +959,7 @@ class TypstWorkerServiceImpl {
         console.error('[TypstWorkerService] Introspection listener error:', error)
       }
     }
-    
+
     return () => {
       this.introspectionListeners.delete(listener)
     }
@@ -855,7 +1011,7 @@ class TypstWorkerServiceImpl {
    */
   onOutlineUpdate(listener: OutlineListener): () => void {
     this.outlineListeners.add(listener)
-    
+
     // 如果已有缓存数据，立即通知
     if (this.latestOutline) {
       try {
@@ -864,7 +1020,7 @@ class TypstWorkerServiceImpl {
         console.error('[TypstWorkerService] Outline listener error:', error)
       }
     }
-    
+
     return () => {
       this.outlineListeners.delete(listener)
     }

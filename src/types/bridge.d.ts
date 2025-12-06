@@ -246,3 +246,45 @@ export function isPanic(msg: WorkerToMainMessage): msg is PanicMessage {
 export function isHeartbeatAck(msg: WorkerToMainMessage): msg is HeartbeatAckMessage {
     return msg.kind === 'HEARTBEAT_ACK'
 }
+
+// ============================================================================
+// Type-Safe Message Sending
+// ============================================================================
+
+/**
+ * Send a message to the worker with compile-time type validation
+ * 
+ * @example
+ * ```typescript
+ * sendToWorker(worker, {
+ *   kind: 'COMPILE',
+ *   source: '...',
+ *   requestId: '123'
+ * })
+ * ```
+ */
+export function sendToWorker(
+    worker: Worker,
+    message: MainToWorkerMessage,
+    transfer?: Transferable[]
+): void {
+    if (transfer && transfer.length > 0) {
+        worker.postMessage(message satisfies MainToWorkerMessage, transfer)
+    } else {
+        worker.postMessage(message satisfies MainToWorkerMessage)
+    }
+}
+
+/**
+ * Post a response from worker to main thread with type validation
+ */
+export function postWorkerResponse(
+    message: WorkerToMainMessage,
+    transfer?: Transferable[]
+): void {
+    if (transfer && transfer.length > 0) {
+        self.postMessage(message satisfies WorkerToMainMessage, transfer)
+    } else {
+        self.postMessage(message satisfies WorkerToMainMessage)
+    }
+}

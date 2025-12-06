@@ -182,15 +182,15 @@ export function useTypstCompiler(): UseTypstCompilerReturn {
 
   // 组件挂载时初始化编译器
   useEffect(() => {
-    isMountedRef.current = true
+    let active = true
 
     const initCompiler = async () => {
-      if (TypstWorkerService.isReady()) return // 已初始化
+      if (!active || TypstWorkerService.isReady()) return // 已初始化或已卸载
 
       try {
         await TypstWorkerService.init()
       } catch (err) {
-        if (isMountedRef.current) {
+        if (active) {
           setError({
             type: 'init_error',
             message: `Failed to initialize Typst compiler: ${err instanceof Error ? err.message : String(err)}`,
@@ -202,8 +202,12 @@ export function useTypstCompiler(): UseTypstCompilerReturn {
 
     initCompiler()
 
+    // Cleanup: Dispose worker to prevent zombie workers on unmount/HMR
     return () => {
-      isMountedRef.current = false
+      active = false
+      // Note: Disposing singleton worker - affects all consumers
+      // In multi-consumer scenarios, consider reference counting
+      TypstWorkerService.dispose()
     }
   }, [])
 
