@@ -364,6 +364,38 @@ export interface ReadyMessage {
   type: 'ready'
 }
 
+// ============================================================================
+// Worker Health Metrics
+// ============================================================================
+
+/**
+ * Worker 健康指标 - 用于内存监控和软重启决策
+ */
+export interface WorkerHealthMetrics {
+  /** 编译时间 (ms) */
+  compileTime: number
+  /** Artifact 大小 (bytes) */
+  artifactSize: number
+  /** 估算页数 */
+  estimatedPages: number
+  /** 是否发生错误 */
+  hasError: boolean
+  /** 是否发生 Panic */
+  hasPanic: boolean
+  /** Worker 启动时间戳 */
+  workerStartTime: number
+  /** 累计编译次数 */
+  totalCompilations: number
+}
+
+/**
+ * 健康指标上报 - Worker 主动推送
+ */
+export interface HealthMetricsMessage {
+  type: 'health_metrics'
+  payload: WorkerHealthMetrics
+}
+
 /**
  * 内省数据响应 - 编译成功后主动推送
  * 包含所有追踪标记的位置信息，用于实现源码-预览同步
@@ -389,6 +421,7 @@ export type WorkerToMainMessage =
   | ReadyMessage
   | IntrospectionResponse
   | OutlineResponse
+  | HealthMetricsMessage
 
 // ============================================================================
 // Helper Types

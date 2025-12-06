@@ -9,6 +9,7 @@ import { useTypstCompiler } from '../hooks'
 import { useDebouncedCallback } from '../utils/useDebounce'
 import { TypstPreview } from './TypstPreview'
 import { OutlinePanel } from './OutlinePanel'
+import { WorkerHealthIndicator } from './WorkerHealthIndicator'
 import type { OutlineHeading, OutlineFigure } from '../workers/types'
 
 // ============================================================================
@@ -59,6 +60,7 @@ function StatusBar({ status, artifactSize, compileTime }: StatusBarProps) {
       <div className="status-left">
         <span className={`status-dot status-${status}`} />
         <span className="status-text">{status}</span>
+        <WorkerHealthIndicator compact showDetails={false} />
       </div>
       <div className="status-right">
         {compileTime !== null && (

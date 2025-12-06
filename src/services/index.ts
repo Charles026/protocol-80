@@ -15,7 +15,20 @@ export type {
   WorkerStatusEvent,
   StatusListener,
   IntrospectionListener,
+  OutlineListener,
+  HealthStatusListener,
+  SoftRestartEvent,
+  SoftRestartListener,
 } from './TypstWorkerService'
+
+export { WorkerHealthMonitor } from './WorkerHealthMonitor'
+export type {
+  HealthMetrics,
+  CompilationRecord,
+  HealthStatus,
+  HealthStatusEvent,
+  HealthListener,
+} from './WorkerHealthMonitor'
 
 // Re-export introspection types from workers/types
 export type {
@@ -25,6 +38,7 @@ export type {
   IntrospectionData,
   DebugBox,
   DebugBoxType,
+  WorkerHealthMetrics,
 } from '../workers/types'
 
 // Re-export debug box colors

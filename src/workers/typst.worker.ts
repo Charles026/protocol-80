@@ -27,6 +27,7 @@ import type {
   OutlineData,
   OutlineHeading,
   OutlineFigure,
+  WorkerHealthMetrics,
 } from './types'
 
 // ============================================================================
@@ -50,6 +51,46 @@ const pendingFontRequests = new Map<string, {
  * 已加载的字体缓存（避免重复请求）
  */
 const loadedFonts = new Set<string>()
+
+// ============================================================================
+// Health Metrics Tracking
+// ============================================================================
+
+/** Worker 启动时间 */
+const workerStartTime = Date.now()
+
+/** 累计编译次数 */
+let totalCompilations = 0
+
+/** 最近一次编译是否发生 Panic */
+let lastCompilePanic = false
+
+/**
+ * 估算文档页数
+ * 基于 artifact 大小的经验估算
+ * 
+ * @param artifactSize - Artifact 字节大小
+ * @returns 估算的页数
+ */
+function estimatePageCount(artifactSize: number): number {
+  // 经验值：每页平均约 50KB artifact 数据
+  const BYTES_PER_PAGE = 50 * 1024
+  return Math.max(1, Math.ceil(artifactSize / BYTES_PER_PAGE))
+}
+
+/**
+ * 发送健康指标到主线程
+ */
+function reportHealthMetrics(metrics: Omit<WorkerHealthMetrics, 'workerStartTime' | 'totalCompilations'>): void {
+  postResponse({
+    type: 'health_metrics',
+    payload: {
+      ...metrics,
+      workerStartTime,
+      totalCompilations,
+    },
+  })
+}
 
 // ============================================================================
 // Message Utilities
@@ -118,7 +159,7 @@ export async function requestFont(family: string): Promise<ArrayBuffer | null> {
   // 创建新请求
   return new Promise((resolve, reject) => {
     const requestId = generateId()
-    
+
     pendingFontRequests.set(family, { resolve, reject })
 
     // 向主线程请求字体
@@ -144,7 +185,7 @@ export async function requestFont(family: string): Promise<ArrayBuffer | null> {
  */
 function handleFontResponse(response: FontResponse): void {
   const pending = pendingFontRequests.get(response.family)
-  
+
   if (!pending) {
     console.warn(`[Worker] Unexpected font response for: ${response.family}`)
     return
@@ -228,7 +269,7 @@ async function resetCompiler(): Promise<void> {
 
   // 调用 reset() 清理内部状态
   await compiler.reset()
-  
+
   // 清理 shadow 文件系统
   compiler.resetShadow()
 }
@@ -244,7 +285,7 @@ function disposeCompiler(): void {
     }
     compiler = null
   }
-  
+
   compilerState = 'disposed'
   loadedFonts.clear()
   pendingFontRequests.clear()
@@ -307,7 +348,7 @@ function queryIntrospection(_mainFilePath: string): IntrospectionData | null {
   // TODO: 实现正确的 query 调用
   // const snapshot = compiler.snapshot(null, mainFilePath, null)
   // const queryResult = snapshot.query(0, INTROSPECTION_SELECTOR)
-  
+
   return null
 }
 
@@ -338,7 +379,7 @@ function pushIntrospectionData(_requestId: string, mainFilePath: string): void {
   }
 
   const introspection = queryIntrospection(mainFilePath)
-  
+
   if (introspection && introspection.markers.length > 0) {
     postResponse({
       type: 'introspection_result',
@@ -376,26 +417,26 @@ let lastOutlineHash = ''
 function extractHeadings(source: string): OutlineHeading[] {
   const headings: OutlineHeading[] = []
   const lines = source.split('\n')
-  
+
   // 简单的页面估算：假设每 60 行是一页（粗略估计）
   const LINES_PER_PAGE = 60
-  
+
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]
     if (!line) continue
-    
+
     const trimmed = line.trim()
-    
+
     // 匹配标题：以 = 开头，后跟空格和标题内容
     const match = trimmed.match(/^(={1,6})\s+(.+)$/)
     if (match && match[1] && match[2]) {
       const level = match[1].length
       const body = match[2].trim()
       const page = Math.floor(i / LINES_PER_PAGE) + 1
-      
+
       // 估算 Y 位置（基于行号）
       const y = (i % LINES_PER_PAGE) * 12 // 假设每行 12pt
-      
+
       headings.push({
         level,
         body,
@@ -404,7 +445,7 @@ function extractHeadings(source: string): OutlineHeading[] {
       })
     }
   }
-  
+
   return headings
 }
 
@@ -422,21 +463,21 @@ function extractHeadings(source: string): OutlineHeading[] {
 function extractFigures(source: string): OutlineFigure[] {
   const figures: OutlineFigure[] = []
   const lines = source.split('\n')
-  
+
   // 计数器
   const counters: Record<string, number> = {
     image: 0,
     table: 0,
     figure: 0,
   }
-  
+
   const LINES_PER_PAGE = 60
-  
+
   // 查找每个 figure 的位置
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]
     if (!line) continue
-    
+
     if (line.includes('#figure')) {
       // 尝试确定 figure 类型
       let kind = 'figure'
@@ -447,10 +488,10 @@ function extractFigures(source: string): OutlineFigure[] {
       } else if (line.includes('raw(') || line.includes('raw (')) {
         kind = 'raw'
       }
-      
+
       // 增加计数
       counters[kind] = (counters[kind] || 0) + 1
-      
+
       // 尝试提取 caption
       let caption = ''
       const captionMatch = line.match(/caption:\s*\[(.*?)\]/)
@@ -461,7 +502,7 @@ function extractFigures(source: string): OutlineFigure[] {
         for (let j = i + 1; j < Math.min(i + 5, lines.length); j++) {
           const nextLine = lines[j]
           if (!nextLine) continue
-          
+
           const captionInNextLine = nextLine.match(/caption:\s*\[(.*?)\]/)
           if (captionInNextLine && captionInNextLine[1]) {
             caption = captionInNextLine[1]
@@ -473,10 +514,10 @@ function extractFigures(source: string): OutlineFigure[] {
           }
         }
       }
-      
+
       const page = Math.floor(i / LINES_PER_PAGE) + 1
       const y = (i % LINES_PER_PAGE) * 12
-      
+
       figures.push({
         kind,
         caption,
@@ -486,7 +527,7 @@ function extractFigures(source: string): OutlineFigure[] {
       })
     }
   }
-  
+
   return figures
 }
 
@@ -512,11 +553,11 @@ function simpleHash(str: string): string {
 function extractOutline(source: string): OutlineData {
   const headings = extractHeadings(source)
   const figures = extractFigures(source)
-  
+
   // 估算页数（基于内容量）
   const lines = source.split('\n').length
   const pageCount = Math.max(1, Math.ceil(lines / 60))
-  
+
   return {
     headings,
     figures,
@@ -534,17 +575,17 @@ function pushOutlineData(requestId: string, source: string): void {
   if (!OUTLINE_ENABLED) {
     return
   }
-  
+
   try {
     const outline = extractOutline(source)
-    
+
     // 检查是否有变化（避免重复推送）
     const hash = simpleHash(JSON.stringify(outline))
     if (hash === lastOutlineHash) {
       return
     }
     lastOutlineHash = hash
-    
+
     postResponse({
       type: 'outline_result',
       id: requestId,
@@ -680,11 +721,20 @@ async function handleMessage(event: MessageEvent<MainToWorkerMessage>): Promise<
     }
 
     case 'compile': {
+      const compileStartTime = performance.now()
+      lastCompilePanic = false
+
       try {
         const { source, mainFilePath, format } = message.payload
         const result = await compile(source, mainFilePath, format)
+        const compileTime = performance.now() - compileStartTime
+
+        totalCompilations++
 
         if (result.artifact) {
+          const artifactSize = result.artifact.byteLength
+          const estimatedPages = estimatePageCount(artifactSize)
+
           // 使用 Transferable 传输 Uint8Array，避免拷贝
           postResponse(
             {
@@ -703,11 +753,20 @@ async function handleMessage(event: MessageEvent<MainToWorkerMessage>): Promise<
           setTimeout(() => {
             pushIntrospectionData(message.id, mainFilePath)
             pushOutlineData(message.id, source)
+
+            // 上报健康指标
+            reportHealthMetrics({
+              compileTime,
+              artifactSize,
+              estimatedPages,
+              hasError: false,
+              hasPanic: lastCompilePanic,
+            })
           }, 0)
         } else {
           const errorMsg = result.diagnostics.find(d => d.severity === 'error')?.message
             ?? 'Compilation failed with no output'
-          
+
           postResponse({
             type: 'compile_error',
             id: message.id,
@@ -716,26 +775,61 @@ async function handleMessage(event: MessageEvent<MainToWorkerMessage>): Promise<
               diagnostics: result.diagnostics,
             },
           })
+
+          // 上报编译错误的健康指标
+          reportHealthMetrics({
+            compileTime,
+            artifactSize: 0,
+            estimatedPages: 0,
+            hasError: true,
+            hasPanic: lastCompilePanic,
+          })
         }
       } catch (error) {
+        const compileTime = performance.now() - compileStartTime
+        const errorMessage = error instanceof Error ? error.message : String(error)
+
+        // 检测是否是 Panic
+        if (errorMessage.includes('panicked') || errorMessage.includes('unwrap')) {
+          lastCompilePanic = true
+        }
+
         postResponse({
           type: 'compile_error',
           id: message.id,
           payload: {
-            error: error instanceof Error ? error.message : String(error),
+            error: errorMessage,
             diagnostics: [],
           },
+        })
+
+        // 上报异常的健康指标
+        reportHealthMetrics({
+          compileTime,
+          artifactSize: 0,
+          estimatedPages: 0,
+          hasError: true,
+          hasPanic: lastCompilePanic,
         })
       }
       break
     }
 
     case 'incremental_update': {
+      const compileStartTime = performance.now()
+      lastCompilePanic = false
+
       try {
         const { path, content } = message.payload
         const result = await incrementalUpdate(path, content)
+        const compileTime = performance.now() - compileStartTime
+
+        totalCompilations++
 
         if (result.artifact) {
+          const artifactSize = result.artifact.byteLength
+          const estimatedPages = estimatePageCount(artifactSize)
+
           postResponse(
             {
               type: 'compile_success',
@@ -752,11 +846,20 @@ async function handleMessage(event: MessageEvent<MainToWorkerMessage>): Promise<
           setTimeout(() => {
             pushIntrospectionData(message.id, path)
             pushOutlineData(message.id, content)
+
+            // 上报健康指标
+            reportHealthMetrics({
+              compileTime,
+              artifactSize,
+              estimatedPages,
+              hasError: false,
+              hasPanic: lastCompilePanic,
+            })
           }, 0)
         } else {
           const errorMsg = result.diagnostics.find(d => d.severity === 'error')?.message
             ?? 'Incremental compilation failed'
-          
+
           postResponse({
             type: 'compile_error',
             id: message.id,
@@ -765,15 +868,41 @@ async function handleMessage(event: MessageEvent<MainToWorkerMessage>): Promise<
               diagnostics: result.diagnostics,
             },
           })
+
+          // 上报编译错误的健康指标
+          reportHealthMetrics({
+            compileTime,
+            artifactSize: 0,
+            estimatedPages: 0,
+            hasError: true,
+            hasPanic: lastCompilePanic,
+          })
         }
       } catch (error) {
+        const compileTime = performance.now() - compileStartTime
+        const errorMessage = error instanceof Error ? error.message : String(error)
+
+        // 检测是否是 Panic
+        if (errorMessage.includes('panicked') || errorMessage.includes('unwrap')) {
+          lastCompilePanic = true
+        }
+
         postResponse({
           type: 'compile_error',
           id: message.id,
           payload: {
-            error: error instanceof Error ? error.message : String(error),
+            error: errorMessage,
             diagnostics: [],
           },
+        })
+
+        // 上报异常的健康指标
+        reportHealthMetrics({
+          compileTime,
+          artifactSize: 0,
+          estimatedPages: 0,
+          hasError: true,
+          hasPanic: lastCompilePanic,
         })
       }
       break
@@ -815,16 +944,144 @@ async function handleMessage(event: MessageEvent<MainToWorkerMessage>): Promise<
 }
 
 // ============================================================================
+// Global Crash Traps (Phoenix Protocol Support)
+// ============================================================================
+
+/**
+ * Global error handler for uncaught exceptions
+ * 
+ * Catches Wasm RuntimeError (panics) and notifies the Supervisor
+ * before the Worker becomes unresponsive.
+ */
+self.onerror = (event: Event | string, _source?: string, _lineno?: number, _colno?: number, error?: Error): boolean => {
+  const reason = typeof event === 'string'
+    ? event
+    : error?.message ?? 'Unknown error'
+
+  const isPanic = reason.includes('RuntimeError') ||
+    reason.includes('unreachable') ||
+    reason.includes('panicked')
+
+  console.error('[Worker] Global error caught:', reason)
+
+  // Send PANIC message using bridge protocol format
+  try {
+    self.postMessage({
+      kind: 'PANIC',
+      reason: reason,
+      stack: error?.stack,
+    })
+  } catch {
+    // Last resort - Worker may be dying
+    console.error('[Worker] Failed to send PANIC message')
+  }
+
+  // Mark last compile as panic if applicable
+  if (isPanic) {
+    lastCompilePanic = true
+  }
+
+  // Return true to prevent default error handling (we've handled it)
+  return true
+}
+
+/**
+ * Handler for unhandled Promise rejections
+ * 
+ * Catches async Wasm panics that manifest as rejected promises.
+ */
+self.onunhandledrejection = (event: PromiseRejectionEvent): void => {
+  const reason = event.reason
+  const message = reason instanceof Error ? reason.message : String(reason)
+
+  const isPanic = message.includes('RuntimeError') ||
+    message.includes('unreachable') ||
+    message.includes('panicked') ||
+    message.includes('unwrap')
+
+  console.error('[Worker] Unhandled rejection:', message)
+
+  if (isPanic) {
+    lastCompilePanic = true
+
+    try {
+      self.postMessage({
+        kind: 'PANIC',
+        reason: message,
+        stack: reason instanceof Error ? reason.stack : undefined,
+      })
+    } catch {
+      console.error('[Worker] Failed to send PANIC message')
+    }
+  }
+}
+
+// ============================================================================
+// Heartbeat Handler
+// ============================================================================
+
+/**
+ * Respond to heartbeat pings from the Supervisor
+ * 
+ * This allows the main thread to detect if the Worker is deadlocked.
+ * If no HEARTBEAT_ACK is received within timeout, the Supervisor
+ * triggers the Phoenix Protocol.
+ */
+function handleHeartbeat(timestamp: number): void {
+  self.postMessage({
+    kind: 'HEARTBEAT_ACK',
+    timestamp,
+  })
+}
+
+// ============================================================================
 // Worker Entry Point
 // ============================================================================
 
 // 注册消息处理器
 self.addEventListener('message', (event: MessageEvent<MainToWorkerMessage>) => {
+  const message = event.data
+
+  // Handle bridge protocol messages (using 'kind' discriminator)
+  if ('kind' in message) {
+    const bridgeMsg = message as { kind: string; timestamp?: number }
+    switch (bridgeMsg.kind) {
+      case 'HEARTBEAT':
+        if (typeof bridgeMsg.timestamp === 'number') {
+          handleHeartbeat(bridgeMsg.timestamp)
+        }
+        return
+      case 'DISPOSE':
+        disposeCompiler()
+        return
+      // Other bridge protocol messages can be added here
+    }
+  }
+
+  // Handle legacy protocol messages (using 'type' discriminator)
   handleMessage(event).catch((error) => {
     console.error('[Worker] Unhandled error:', error)
+
+    // Attempt to send panic for unhandled errors in message processing
+    const errorMessage = error instanceof Error ? error.message : String(error)
+    if (errorMessage.includes('RuntimeError') || errorMessage.includes('panicked')) {
+      try {
+        self.postMessage({
+          kind: 'PANIC',
+          reason: errorMessage,
+          stack: error instanceof Error ? error.stack : undefined,
+        })
+      } catch {
+        // Worker is dying
+      }
+    }
   })
 })
 
-// 通知主线程 Worker 已就绪
+// 通知主线程 Worker 已就绪 (legacy protocol)
 postResponse({ type: 'ready' })
+
+// Also send READY via bridge protocol
+self.postMessage({ kind: 'READY' })
+
 

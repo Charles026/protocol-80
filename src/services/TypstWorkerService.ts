@@ -6,6 +6,7 @@
  * 2. Promise 化 API：所有 Worker 通信转换为 Promise
  * 3. 错误恢复：Worker 崩溃时自动重启
  * 4. 类型安全：严格的消息类型检查
+ * 5. 健康监控：内存使用监控和软重启机制
  */
 
 import type {
@@ -17,8 +18,10 @@ import type {
   SourceMarker,
   OutlineData,
   OutlineHeading,
+  WorkerHealthMetrics,
 } from '../workers/types'
 import { FontService } from './FontService'
+import { WorkerHealthMonitor, type HealthStatus, type HealthStatusEvent } from './WorkerHealthMonitor'
 
 // ============================================================================
 // Types
@@ -59,6 +62,25 @@ export type IntrospectionListener = (data: IntrospectionData) => void
  */
 export type OutlineListener = (data: OutlineData) => void
 
+/**
+ * 健康状态监听器
+ */
+export type HealthStatusListener = (event: HealthStatusEvent) => void
+
+/**
+ * 软重启事件
+ */
+export interface SoftRestartEvent {
+  reason: string
+  previousUptime: number
+  timestamp: number
+}
+
+/**
+ * 软重启监听器
+ */
+export type SoftRestartListener = (event: SoftRestartEvent) => void
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -66,6 +88,15 @@ export type OutlineListener = (data: OutlineData) => void
 const REQUEST_TIMEOUT = 60000 // 60 seconds
 const MAX_RESTART_ATTEMPTS = 3
 const RESTART_DELAY = 1000 // 1 second
+
+/** 软重启冷却时间（防止频繁重启） */
+const SOFT_RESTART_COOLDOWN = 30000 // 30 seconds
+
+/** 最大软重启次数（短时间内） */
+const MAX_SOFT_RESTARTS = 3
+
+/** 软重启计数重置时间 */
+const SOFT_RESTART_RESET_INTERVAL = 5 * 60 * 1000 // 5 minutes
 
 // ============================================================================
 // Worker Service Implementation
@@ -99,9 +130,54 @@ class TypstWorkerServiceImpl {
   private workerReadyPromise: Promise<void> | null = null
   private workerReadyResolve: (() => void) | null = null
 
+  // --------------------------------------------------------------------------
+  // Soft Restart State
+  // --------------------------------------------------------------------------
+
+  /** 健康状态监听器 */
+  private healthListeners = new Set<HealthStatusListener>()
+
+  /** 软重启监听器 */
+  private softRestartListeners = new Set<SoftRestartListener>()
+
+  /** 最后一次软重启时间 */
+  private lastSoftRestartTime = 0
+
+  /** 短时间内软重启次数 */
+  private softRestartCount = 0
+
+  /** 软重启计数重置定时器 */
+  private softRestartResetTimer: ReturnType<typeof setTimeout> | null = null
+
+  /** 是否正在执行软重启 */
+  private isSoftRestarting = false
+
+  /** 当前健康状态 */
+  private currentHealthStatus: HealthStatus = 'healthy'
+
   constructor() {
     // 自动创建 Worker
     this.createWorker()
+    
+    // 订阅健康监控事件
+    this.setupHealthMonitoring()
+  }
+
+  /**
+   * 设置健康监控
+   */
+  private setupHealthMonitoring(): void {
+    WorkerHealthMonitor.onHealthChange((event) => {
+      this.currentHealthStatus = event.status
+      
+      // 通知健康状态监听器
+      this.notifyHealthListeners(event)
+      
+      // 检查是否需要软重启
+      if (event.metrics.needsRestart) {
+        this.triggerSoftRestart(event.metrics.restartReason ?? 'Health check triggered restart')
+      }
+    })
   }
 
   // --------------------------------------------------------------------------
@@ -193,7 +269,26 @@ class TypstWorkerServiceImpl {
         // Worker 主动推送的大纲数据
         this.handleOutlineResult(message.payload)
         break
+
+      case 'health_metrics':
+        // Worker 上报的健康指标
+        this.handleHealthMetrics(message.payload)
+        break
     }
+  }
+
+  /**
+   * 处理 Worker 上报的健康指标
+   */
+  private handleHealthMetrics(metrics: WorkerHealthMetrics): void {
+    // 将指标传递给健康监控器
+    WorkerHealthMonitor.recordCompilation({
+      compileTime: metrics.compileTime,
+      artifactSize: metrics.artifactSize,
+      estimatedPages: metrics.estimatedPages,
+      hasError: metrics.hasError,
+      hasPanic: metrics.hasPanic,
+    })
   }
 
   /**
@@ -267,6 +362,153 @@ class TypstWorkerServiceImpl {
     await new Promise(resolve => setTimeout(resolve, RESTART_DELAY))
     
     this.createWorker()
+  }
+
+  // --------------------------------------------------------------------------
+  // Soft Restart (Memory Management)
+  // --------------------------------------------------------------------------
+
+  /**
+   * 触发软重启
+   * 
+   * 当检测到内存问题或大文档时，静默销毁旧 Worker 并创建新实例。
+   * 包含冷却时间和频率限制，防止无限重启。
+   * 
+   * @param reason - 重启原因
+   */
+  private async triggerSoftRestart(reason: string): Promise<void> {
+    // 检查是否正在重启
+    if (this.isSoftRestarting) {
+      console.log('[TypstWorkerService] Soft restart already in progress, skipping')
+      return
+    }
+
+    // 检查冷却时间
+    const now = Date.now()
+    if (now - this.lastSoftRestartTime < SOFT_RESTART_COOLDOWN) {
+      console.log('[TypstWorkerService] Soft restart cooldown active, skipping')
+      return
+    }
+
+    // 检查重启频率
+    if (this.softRestartCount >= MAX_SOFT_RESTARTS) {
+      console.warn('[TypstWorkerService] Max soft restarts reached, waiting for reset')
+      return
+    }
+
+    this.isSoftRestarting = true
+    this.softRestartCount++
+    this.lastSoftRestartTime = now
+
+    // 设置计数重置定时器
+    this.setupSoftRestartResetTimer()
+
+    console.log(`[TypstWorkerService] Initiating soft restart: ${reason}`)
+
+    // 记录旧 Worker 的运行时间
+    const previousUptime = WorkerHealthMonitor.getMetrics().workerUptime
+
+    // 通知监听器
+    this.notifySoftRestartListeners({
+      reason,
+      previousUptime,
+      timestamp: now,
+    })
+
+    try {
+      // 暂存待处理的请求（不拒绝，等新 Worker 处理）
+      const pendingRequestsBackup = new Map(this.pendingRequests)
+      
+      // 清除当前请求追踪
+      this.pendingRequests.clear()
+
+      // 终止旧 Worker（不等待）
+      if (this.worker) {
+        this.worker.removeEventListener('message', this.handleWorkerMessage)
+        this.worker.removeEventListener('error', this.handleWorkerError)
+        this.worker.terminate()
+        this.worker = null
+      }
+
+      // 重置状态
+      this.workerReady = false
+      this.status = 'initializing'
+      this.restartAttempts = 0
+
+      // 通知健康监控器重置
+      WorkerHealthMonitor.resetOnRestart()
+
+      // 创建新 Worker
+      this.createWorker()
+
+      // 等待新 Worker 就绪
+      await this.workerReadyPromise
+
+      // 初始化新编译器
+      await this.init()
+
+      console.log('[TypstWorkerService] Soft restart completed successfully')
+
+      // 重新发送备份的请求（可选，取决于业务需求）
+      // 这里选择不重发，让调用方处理重试逻辑
+      // 拒绝备份的请求，提示重试
+      for (const [, request] of pendingRequestsBackup) {
+        request.reject(new Error(`Worker restarted: ${reason}. Please retry the operation.`))
+        if (request.timeout) clearTimeout(request.timeout)
+      }
+
+    } catch (error) {
+      console.error('[TypstWorkerService] Soft restart failed:', error)
+      this.status = 'worker_error'
+      this.notifyStatusChange({ 
+        status: 'worker_error', 
+        error: `Soft restart failed: ${error instanceof Error ? error.message : String(error)}` 
+      })
+    } finally {
+      this.isSoftRestarting = false
+    }
+  }
+
+  /**
+   * 设置软重启计数重置定时器
+   */
+  private setupSoftRestartResetTimer(): void {
+    // 清除现有定时器
+    if (this.softRestartResetTimer) {
+      clearTimeout(this.softRestartResetTimer)
+    }
+
+    // 设置新定时器
+    this.softRestartResetTimer = setTimeout(() => {
+      this.softRestartCount = 0
+      console.log('[TypstWorkerService] Soft restart count reset')
+    }, SOFT_RESTART_RESET_INTERVAL)
+  }
+
+  /**
+   * 通知健康状态监听器
+   */
+  private notifyHealthListeners(event: HealthStatusEvent): void {
+    for (const listener of this.healthListeners) {
+      try {
+        listener(event)
+      } catch (error) {
+        console.error('[TypstWorkerService] Health listener error:', error)
+      }
+    }
+  }
+
+  /**
+   * 通知软重启监听器
+   */
+  private notifySoftRestartListeners(event: SoftRestartEvent): void {
+    for (const listener of this.softRestartListeners) {
+      try {
+        listener(event)
+      } catch (error) {
+        console.error('[TypstWorkerService] Soft restart listener error:', error)
+      }
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -656,6 +898,62 @@ class TypstWorkerServiceImpl {
   getHeadingTree(): OutlineHeadingNode[] {
     if (!this.latestOutline) return []
     return buildHeadingTree(this.latestOutline.headings)
+  }
+
+  // --------------------------------------------------------------------------
+  // Health Monitoring API
+  // --------------------------------------------------------------------------
+
+  /**
+   * 订阅健康状态变化
+   * 
+   * @param listener - 状态变化回调
+   * @returns 取消订阅函数
+   */
+  onHealthChange(listener: HealthStatusListener): () => void {
+    this.healthListeners.add(listener)
+    return () => this.healthListeners.delete(listener)
+  }
+
+  /**
+   * 订阅软重启事件
+   * 
+   * @param listener - 软重启事件回调
+   * @returns 取消订阅函数
+   */
+  onSoftRestart(listener: SoftRestartListener): () => void {
+    this.softRestartListeners.add(listener)
+    return () => this.softRestartListeners.delete(listener)
+  }
+
+  /**
+   * 获取当前健康状态
+   */
+  getHealthStatus(): HealthStatus {
+    return this.currentHealthStatus
+  }
+
+  /**
+   * 获取详细健康指标
+   */
+  getHealthMetrics() {
+    return WorkerHealthMonitor.getMetrics()
+  }
+
+  /**
+   * 手动触发软重启
+   * 
+   * @param reason - 重启原因
+   */
+  async manualSoftRestart(reason = 'Manual restart requested'): Promise<void> {
+    await this.triggerSoftRestart(reason)
+  }
+
+  /**
+   * 检查是否正在执行软重启
+   */
+  isSoftRestartInProgress(): boolean {
+    return this.isSoftRestarting
   }
 }
 
