@@ -1,8 +1,10 @@
 /**
- * Typst Compiler Web Worker
- * 
- * Simplified worker for the Monolith Editor MVP.
- * Handles WASM compilation, font loading, and probe extraction.
+ * Typst Compiler Web Worker (App Shell)
+ *
+ * Responsibilities:
+ * - Load fonts and probe library into the Typst VFS
+ * - Compile Typst source
+ * - Extract probe metadata using the compiled world (no post-compile mutations)
  */
 
 import {
@@ -12,7 +14,7 @@ import {
 import { loadFonts } from '@myriaddreamin/typst.ts'
 
 // ============================================================================
-// Types
+// Types (local to keep the worker standalone for Vite bundling)
 // ============================================================================
 
 interface ProbeLocation {
@@ -27,6 +29,7 @@ interface ProbeData {
     payload: Record<string, unknown>
     location: ProbeLocation
     _seq: number
+    _v?: string
 }
 
 interface CompileRequest {
@@ -45,7 +48,12 @@ interface HeartbeatRequest {
     timestamp: number
 }
 
-type WorkerRequest = CompileRequest | InitRequest | HeartbeatRequest
+interface ResetRequest {
+    kind: 'RESET'
+    requestId: string
+}
+
+type WorkerRequest = CompileRequest | InitRequest | HeartbeatRequest | ResetRequest
 
 interface CompileSuccess {
     kind: 'COMPILE_SUCCESS'
@@ -76,7 +84,25 @@ interface HeartbeatAck {
     timestamp: number
 }
 
-type WorkerResponse = CompileSuccess | CompileError | WorkerReady | WorkerPanic | HeartbeatAck
+interface ResetSuccess {
+    kind: 'RESET_SUCCESS'
+    requestId: string
+}
+
+type WorkerResponse =
+    | CompileSuccess
+    | CompileError
+    | WorkerReady
+    | WorkerPanic
+    | HeartbeatAck
+    | ResetSuccess
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const MAIN_FILE_PATH = '/main.typ'
+const PROBE_LIB_PATH = '/lib/probe.typ'
 
 // ============================================================================
 // Worker State
@@ -86,31 +112,26 @@ let compiler: TypstCompiler | null = null
 let isInitializing = false
 let probeLibrarySource: string | null = null
 
-// Font data buffers (loaded once during init)
-
 // ============================================================================
-// Message Posting
+// Messaging helpers
 // ============================================================================
 
 function postMessage(message: WorkerResponse, transfer?: Transferable[]): void {
-    if (transfer) {
-        (self as unknown as Worker).postMessage(message, transfer)
+    if (transfer && transfer.length > 0) {
+        ; (self as unknown as Worker).postMessage(message, transfer)
     } else {
         self.postMessage(message)
     }
 }
 
 // ============================================================================
-// Probe Library Loading
+// Asset Loading
 // ============================================================================
 
-/**
- * Fetch the probe library source from public directory.
- */
 async function fetchProbeLibrary(): Promise<string> {
     console.log('[Worker] Fetching probe.typ library...')
     try {
-        const response = await fetch('/lib/probe.typ')
+        const response = await fetch(PROBE_LIB_PATH)
         if (!response.ok) {
             throw new Error(`Failed to fetch probe.typ: ${response.status}`)
         }
@@ -151,68 +172,6 @@ async function fetchProbeLibrary(): Promise<string> {
     }
 }
 
-// ============================================================================
-// Compiler Functions
-// ============================================================================
-
-function getWasmModuleUrl(): string {
-    return new URL(
-        '@myriaddreamin/typst-ts-web-compiler/pkg/typst_ts_web_compiler_bg.wasm',
-        import.meta.url
-    ).href
-}
-
-async function initCompiler(): Promise<void> {
-    if (compiler || isInitializing) return
-
-    isInitializing = true
-    console.log('[Worker] Initializing Typst compiler...')
-
-    try {
-        // Fetch probe library and CJK font in parallel
-        // Text/math fonts come from CDN, only CJK is loaded locally
-        const [probeLib, cjkFont] = await Promise.all([
-            fetchProbeLibrary(),
-            fetchFontAsUint8Array('/fonts/NotoSerifSC-Regular.ttf'),
-        ])
-
-        probeLibrarySource = probeLib
-        console.log('[Worker] Assets loaded:', {
-            probe: !!probeLibrarySource,
-            cjk: !!cjkFont,
-        })
-
-        // Create compiler with fonts loaded via beforeBuild
-        compiler = createTypstCompiler()
-
-        // Local CJK font (14MB)
-        const localFonts: Uint8Array[] = []
-        if (cjkFont) localFonts.push(cjkFont)
-
-        await compiler.init({
-            beforeBuild: [
-                // Load text fonts from CDN (includes math fonts like NewCM)
-                // plus our local CJK font
-                loadFonts(localFonts, {
-                    assets: ['text'] // Load LibertinusSerif + NewCM math from CDN
-                }),
-            ],
-            getModule: () => getWasmModuleUrl(),
-        })
-
-        isInitializing = false
-        console.log('[Worker] Typst compiler ready with fonts!')
-        postMessage({ kind: 'READY' })
-    } catch (e) {
-        isInitializing = false
-        console.error('[Worker] Init failed', e)
-        throw e
-    }
-}
-
-/**
- * Fetch a font file as Uint8Array
- */
 async function fetchFontAsUint8Array(path: string): Promise<Uint8Array | null> {
     try {
         const response = await fetch(path)
@@ -229,31 +188,76 @@ async function fetchFontAsUint8Array(path: string): Promise<Uint8Array | null> {
     }
 }
 
-/**
- * Add required files to the compiler's virtual filesystem
- * [CORRECTION] Do NOT reset. Just update the Virtual File System.
- * Typst compiler is stateful; overwriting the file is enough for incremental updates.
- */
+// ============================================================================
+// Compiler Lifecycle
+// ============================================================================
+
+function getWasmModuleUrl(): string {
+    return new URL(
+        '@myriaddreamin/typst-ts-web-compiler/pkg/typst_ts_web_compiler_bg.wasm',
+        import.meta.url
+    ).href
+}
+
+async function initCompiler(): Promise<void> {
+    if (compiler || isInitializing) return
+
+    isInitializing = true
+    console.log('[Worker] Initializing Typst compiler...')
+
+    try {
+        // Load probe library and CJK font in parallel
+        const [probeLib, cjkFont] = await Promise.all([
+            fetchProbeLibrary(),
+            fetchFontAsUint8Array('/fonts/NotoSerifSC-Regular.ttf'),
+        ])
+
+        probeLibrarySource = probeLib
+        console.log('[Worker] Assets loaded:', {
+            probe: !!probeLibrarySource,
+            cjk: !!cjkFont,
+        })
+
+        compiler = createTypstCompiler()
+
+        const localFonts: Uint8Array[] = []
+        if (cjkFont) localFonts.push(cjkFont)
+
+        await compiler.init({
+            beforeBuild: [
+                loadFonts(localFonts, {
+                    assets: ['text'], // pulls text + math fonts from CDN
+                }),
+            ],
+            getModule: () => getWasmModuleUrl(),
+        })
+
+        isInitializing = false
+        console.log('[Worker] Typst compiler ready with fonts!')
+        postMessage({ kind: 'READY' })
+    } catch (e) {
+        isInitializing = false
+        console.error('[Worker] Init failed', e)
+        postMessage({
+            kind: 'PANIC',
+            reason: e instanceof Error ? e.message : String(e),
+        })
+    }
+}
+
 function setupVirtualFileSystem(mainFilePath: string, source: string): void {
     if (!compiler) return
 
-    // Add the probe library (text file) - addSource overwrites if exists
     if (probeLibrarySource) {
-        compiler.addSource('/lib/probe.typ', probeLibrarySource)
+        compiler.addSource(PROBE_LIB_PATH, probeLibrarySource)
     }
-
-    // Add the main source file at fixed path
     compiler.addSource(mainFilePath, source)
 }
 
-/**
- * Extract probe data from query results
- */
 function extractProbesFromResults(results: unknown[]): ProbeData[] {
     const probes: ProbeData[] = []
 
     for (const result of results) {
-        // The query returns objects with a 'value' property
         if (result && typeof result === 'object') {
             const value = (result as { value?: unknown }).value
             if (value && typeof value === 'object' && 'id' in (value as object)) {
@@ -265,6 +269,10 @@ function extractProbesFromResults(results: unknown[]): ProbeData[] {
     return probes
 }
 
+// Note: Probe extraction is now done inline within the runWithWorld callback in compile()
+// to ensure we query from the same compiled world context.
+
+
 async function compile(requestId: string, source: string, mainFilePath: string): Promise<void> {
     if (!compiler) {
         throw new Error('Compiler not initialized')
@@ -273,53 +281,63 @@ async function compile(requestId: string, source: string, mainFilePath: string):
     const start = performance.now()
 
     try {
-        // Set up VFS with fonts, probe library and main source
         setupVirtualFileSystem(mainFilePath, source)
 
-        // Compile the document
-        const result = await compiler.compile({
-            mainFilePath,
-            format: 0, // vector format
-            diagnostics: 'full',
+        // [FIX] Use runWithWorld to compile AND query in the same world context.
+        // This ensures the compiled document is available for probe querying.
+        const result = await compiler.runWithWorld({ mainFilePath }, async (world) => {
+            // 1. Compile the document in this world
+            const compileResult = await world.compile({ diagnostics: 'full' })
+
+            if (compileResult.hasError) {
+                return {
+                    success: false,
+                    diagnostics: compileResult.diagnostics ?? [],
+                    artifact: null,
+                    probes: [],
+                }
+            }
+
+            // 2. Query probes from the SAME compiled world
+            let probes: ProbeData[] = []
+            try {
+                const rawResults = await world.query({ selector: '<monolith-probe>' }) as Array<{ value?: unknown }>
+                probes = extractProbesFromResults(rawResults)
+                console.log(`[Worker] Extracted ${probes.length} probes from compiled world`)
+            } catch (e) {
+                console.warn('[Worker] Probe query failed:', e)
+            }
+
+            // 3. Export artifact from the compiled world
+            const vectorResult = await world.vector({ diagnostics: 'full' })
+
+            return {
+                success: true,
+                diagnostics: vectorResult.diagnostics ?? [],
+                artifact: vectorResult.result as Uint8Array | null,
+                probes,
+            }
         })
 
         const duration = performance.now() - start
-        const artifact = result.result as Uint8Array | null
 
-        if (artifact) {
-            // Extract probes using the existing compiled state.
-            // Do NOT mutate the virtual FS here—addSource would mark the world dirty
-            // and the query API would reject with "document is not compiled".
-            let probes: ProbeData[] = []
-            try {
-                const queryResults = await compiler.query({
-                    mainFilePath,
-                    selector: '<monolith-probe>',
-                }) as unknown[]
-
-                probes = extractProbesFromResults(queryResults)
-                console.log(`[Worker] Extracted ${probes.length} probes:`, probes)
-            } catch (e) {
-                console.warn('[Worker] Probe extraction failed:', e)
-            }
-
-            // Zero-copy transfer
+        if (result.success && result.artifact) {
             postMessage(
                 {
                     kind: 'COMPILE_SUCCESS',
                     requestId,
-                    artifact,
+                    artifact: result.artifact,
                     timing: duration,
-                    probeCount: probes.length,
-                    probes,
+                    probeCount: result.probes.length,
+                    probes: result.probes,
                 },
-                [artifact.buffer]
+                [result.artifact.buffer]
             )
         } else {
-            const diagnostics = result.diagnostics ?? []
-            const errorMsg = diagnostics.length > 0
-                ? JSON.stringify(diagnostics, null, 2)
-                : 'Compilation produced no output'
+            const errorMsg =
+                result.diagnostics.length > 0
+                    ? JSON.stringify(result.diagnostics, null, 2)
+                    : 'Compilation produced no output'
 
             postMessage({
                 kind: 'COMPILE_ERROR',
@@ -353,7 +371,7 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
             compile(
                 msg.requestId,
                 msg.source,
-                msg.mainFilePath ?? '/main.typ'
+                msg.mainFilePath ?? MAIN_FILE_PATH
             ).catch(reportPanic)
             return
 
@@ -362,6 +380,14 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
                 kind: 'HEARTBEAT_ACK',
                 timestamp: msg.timestamp,
             })
+            return
+
+        case 'RESET':
+            if (compiler) {
+                // Keep RESET explicit; not invoked between compile and query paths.
+                compiler.resetShadow()
+            }
+            postMessage({ kind: 'RESET_SUCCESS', requestId: msg.requestId })
             return
 
         default:
@@ -389,3 +415,5 @@ self.onerror = (e) => {
 self.onunhandledrejection = (e: PromiseRejectionEvent) => {
     reportPanic(e.reason)
 }
+
+

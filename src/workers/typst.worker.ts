@@ -122,41 +122,9 @@ async function initCompiler(): Promise<void> {
   }
 }
 
-/**
- * Extract probe data
- * FIX: Do NOT reset shadow here. Use the existing state.
- * FIX: Use correct selector '<monolith-probe>' (no underscores)
- */
-async function extractProbes(mainFilePath: string): Promise<Probe[]> {
-  if (!compiler) return []
+// Note: Probe extraction is now done inline within the runWithWorld callback
+// in runCompile() to ensure we query from the same compiled world context.
 
-  try {
-    // Query directly. The document model is already built by the compile step.
-    const rawResults = (await compiler.query({
-      mainFilePath,
-      selector: '<monolith-probe>',
-    })) as Array<{ value?: unknown }>
-
-    const probes: Probe[] = []
-
-    // Safe extraction
-    for (const result of rawResults) {
-      if (result && typeof result === 'object' && 'value' in result) {
-        const value = result.value as Probe
-        if (value && typeof value === 'object' && 'kind' in value) {
-          probes.push(value)
-        }
-      }
-    }
-
-    console.log(`[Worker] Extracted ${probes.length} probes`)
-    return probes
-  } catch (e) {
-    console.warn('[Worker] Probe extraction failed:', e)
-    // Non-fatal, return empty
-    return []
-  }
-}
 
 /**
  * Compile Typst source code
@@ -175,50 +143,78 @@ async function runCompile(
 
   try {
     // 1. Update Virtual File System
-    // [FIX] Do NOT reset shadow - it clears compilation state needed for query
-    // addSource() overwrites the file in-place, which is sufficient
     compiler.addSource(payload.mainFilePath, payload.source)
 
-    // 2. Compile
-    const result = await compiler.compile({
-      mainFilePath: payload.mainFilePath,
-      format: payload.format === 'pdf' ? 1 : 0,
-      diagnostics: 'full',
+    // [FIX] Use runWithWorld to compile AND query in the same world context.
+    // This ensures the compiled document is available for probe querying.
+    const result = await compiler.runWithWorld({ mainFilePath: payload.mainFilePath }, async (world) => {
+      // 1. Compile the document in this world
+      const compileResult = await world.compile({ diagnostics: 'full' })
+
+      if (compileResult.hasError) {
+        return {
+          success: false,
+          diagnostics: compileResult.diagnostics ?? [],
+          artifact: null,
+          probes: [],
+        }
+      }
+
+      // 2. Query probes from the SAME compiled world
+      let probes: Probe[] = []
+      try {
+        const rawResults = await world.query({ selector: '<monolith-probe>' }) as Array<{ value?: unknown }>
+        for (const r of rawResults) {
+          if (r && typeof r === 'object' && 'value' in r) {
+            const value = r.value as Probe
+            if (value && typeof value === 'object' && 'kind' in value) {
+              probes.push(value)
+            }
+          }
+        }
+        console.log(`[Worker] Extracted ${probes.length} probes from compiled world`)
+      } catch (e) {
+        console.warn('[Worker] Probe query failed:', e)
+      }
+
+      // 3. Export artifact from the compiled world
+      const vectorResult = await world.vector({ diagnostics: 'full' })
+
+      return {
+        success: true,
+        diagnostics: vectorResult.diagnostics ?? [],
+        artifact: vectorResult.result as Uint8Array | null,
+        probes,
+      }
     })
 
     const duration = performance.now() - start
     perfStats.compileCount++
     perfStats.lastDuration = duration
 
-    const diagnostics = (result.diagnostics ?? []) as DiagnosticInfo[]
-    const artifact = result.result as Uint8Array | null
+    if (result.success && result.artifact) {
+      const pageCount = estimatePageCount(result.artifact.byteLength)
 
-    if (artifact) {
-      const pageCount = estimatePageCount(artifact.byteLength)
-
-      // 3. Extract Probes (Immediately after compile)
-      const probes = await extractProbes(payload.mainFilePath)
-
-      // 4. Send Success Response (Zero-Copy for artifact)
+      // Send Success Response (Zero-Copy for artifact)
       postMessage(
         {
           kind: 'COMPILE_SUCCESS',
           requestId,
-          artifact,
+          artifact: result.artifact,
           timing: duration,
-          diagnostics,
+          diagnostics: result.diagnostics as DiagnosticInfo[],
         },
-        [artifact.buffer]
+        [result.artifact.buffer]
       )
 
-      // 5. Send Probe Data
+      // Send Probe Data
       postMessage({
         kind: 'PROBE_RESULT',
         requestId,
         payload: {
           version: '1.0.0',
-          count: probes.length,
-          probes,
+          count: result.probes.length,
+          probes: result.probes,
           pageCount,
         } satisfies ProbeData,
       })
@@ -228,7 +224,7 @@ async function runCompile(
         kind: 'COMPILE_ERROR',
         requestId,
         error: 'Compilation produced no output',
-        diagnostics,
+        diagnostics: result.diagnostics as DiagnosticInfo[],
       })
     }
   } catch (err) {

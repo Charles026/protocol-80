@@ -253,9 +253,11 @@ export function MonolithEditor() {
     // ============================================================================
 
     const renderArtifact = useCallback(async (artifact: Uint8Array) => {
-        // [FIX] Check the Lock. If busy, ABORT this render to save the app from crashing.
+        // [FIX] Queued rendering: if busy, save artifact and render after current completes
         if (isRenderingRef.current) {
-            console.warn('[MonolithEditor] Renderer is busy, skipping frame to prevent Rust aliasing panic.')
+            // Save this as the pending artifact - only keep the latest
+            latestArtifactRef.current = artifact
+            console.log('[MonolithEditor] Render busy, queued latest artifact')
             return
         }
 
@@ -270,7 +272,7 @@ export function MonolithEditor() {
         try {
             isRenderingRef.current = true // LOCK
 
-            // Use renderToCanvas with the container
+            // Render the current artifact
             await renderer.renderToCanvas({
                 container,
                 artifactContent: artifact,
@@ -279,12 +281,21 @@ export function MonolithEditor() {
                 backgroundColor: '#ffffff',
             })
 
-            console.log('[MonolithEditor] Rendered successfully')
-
         } catch (e) {
-            console.error('[MonolithEditor] Render Panic:', e)
+            console.error('[MonolithEditor] Render error:', e)
         } finally {
+            // Add a small cooldown to let Rust WASM fully release resources
+            await new Promise(resolve => setTimeout(resolve, 50))
+
             isRenderingRef.current = false // UNLOCK
+
+            // Check if there's a pending artifact to render
+            const pending = latestArtifactRef.current
+            if (pending && pending !== artifact) {
+                latestArtifactRef.current = null
+                // Use setTimeout for async isolation  
+                setTimeout(() => renderArtifact(pending), 0)
+            }
         }
     }, [])
 
