@@ -5,7 +5,7 @@
  * Input → ProseMirror State → Serialize → Typst Compile → Canvas Render
  */
 
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, useLayoutEffect } from 'react'
 import { Schema } from 'prosemirror-model'
 import { EditorState } from 'prosemirror-state'
 import { createTypstRenderer, type TypstRenderer } from '@myriaddreamin/typst.ts/renderer'
@@ -55,6 +55,154 @@ interface CompileStats {
 }
 
 // ============================================================================
+// Constants
+// ============================================================================
+
+/** Pixels per point - must match renderToCanvas pixelPerPt value */
+const PIXEL_PER_PT = 3.0
+
+/** Default display scale factor (for now fixed, will be dynamic with zoom) */
+const DEFAULT_SCALE = 1.0
+
+// ============================================================================
+// Types for Cursor and Layout
+// ============================================================================
+
+interface CursorState {
+    /** Raw X coordinate from engine (in points) */
+    x: number
+    /** Raw Y coordinate from engine (in points) */
+    y: number
+    /** Cursor height in points */
+    height: number
+    /** Page index (for multi-page support) */
+    pageIndex: number
+}
+
+interface LayoutState {
+    /** Global scale factor (for zoom) */
+    scale: number
+    /** Canvas container padding in pixels */
+    containerPadding: number
+}
+
+// ============================================================================
+// Render Queue - Strictly serializes render calls to prevent Rust aliasing
+// ============================================================================
+
+class RenderQueue {
+    private isBusy: boolean = false
+    private pendingTask: (() => Promise<void>) | null = null
+
+    enqueue(task: () => Promise<void>): void {
+        // If busy, overwrite pending task (conflation/frame skipping)
+        if (this.isBusy) {
+            this.pendingTask = task
+            return
+        }
+
+        // Otherwise start immediately
+        this.process(task)
+    }
+
+    private async process(task: () => Promise<void>) {
+        // console.log('[RenderQueue] Processing task...')
+        this.isBusy = true
+
+        try {
+            await task()
+            // console.log('[RenderQueue] Task finished')
+        } catch (err) {
+            console.warn('[RenderQueue] Task failed:', err)
+            // Extra cooldown on error to let system settle
+            await new Promise(resolve => setTimeout(resolve, 50))
+        } finally {
+            // Unlock on next animation frame for max smoothness
+            requestAnimationFrame(() => {
+                this.isBusy = false
+
+                if (this.pendingTask) {
+                    // console.log('[RenderQueue] Processing pending task...')
+                    const next = this.pendingTask
+                    this.pendingTask = null
+                    this.process(next)
+                } else {
+                    // console.log('[RenderQueue] Idle')
+                }
+            })
+        }
+    }
+}
+
+// ============================================================================
+// Phantom Cursor Component - Scale-aware cursor positioning
+// ============================================================================
+
+interface PhantomCursorProps {
+    cursorState: CursorState | null
+    layoutState: LayoutState
+    containerRef: React.RefObject<HTMLDivElement | null>
+}
+
+/**
+ * PhantomCursor renders a blinking cursor on the canvas.
+ * Position is calculated using: Pos_cursor = (Pos_core × PIXEL_PER_PT × Scale) + Offset
+ * 
+ * Uses useLayoutEffect to prevent visual \"jump\" glitches during zoom.
+ * Uses transform instead of left/top for better GPU performance.
+ */
+function PhantomCursor({ cursorState, layoutState }: PhantomCursorProps) {
+    const cursorRef = useRef<HTMLDivElement>(null)
+
+    useLayoutEffect(() => {
+        if (!cursorRef.current || !cursorState) {
+            if (cursorRef.current) {
+                cursorRef.current.style.display = 'none'
+            }
+            return
+        }
+
+        const { x, y, height } = cursorState
+        const { scale, containerPadding } = layoutState
+
+        // Formula: Pos_cursor = (Pos_core × PIXEL_PER_PT × Scale) + Offset
+        // PIXEL_PER_PT converts pt → px at 1:1 scale
+        // scale applies the current zoom level
+        const visualX = x * PIXEL_PER_PT * scale
+        const visualY = y * PIXEL_PER_PT * scale
+        const visualHeight = height * PIXEL_PER_PT * scale
+
+        // Add container padding offset
+        const finalLeft = containerPadding + visualX
+        const finalTop = containerPadding + visualY
+
+        // Apply styles directly for performance (bypass React render cycle)
+        cursorRef.current.style.display = 'block'
+        cursorRef.current.style.transform = `translate(${finalLeft}px, ${finalTop}px)`
+        cursorRef.current.style.height = `${visualHeight}px`
+
+    }, [cursorState, layoutState])
+
+    // Width stays constant (2px) regardless of scale for visibility
+    return (
+        <div
+            ref={cursorRef}
+            className="phantom-cursor"
+            style={{
+                position: 'absolute',
+                left: 0,
+                top: 0,
+                width: '2px',
+                backgroundColor: '#000000',
+                pointerEvents: 'none',
+                zIndex: 100,
+                display: 'none', // Initially hidden until positioned
+            }}
+        />
+    )
+}
+
+// ============================================================================
 // Component
 // ============================================================================
 
@@ -71,14 +219,29 @@ export function MonolithEditor() {
         artifactSize: 0,
     })
 
+    // Cursor state from probe (raw coordinates in points)
+    const [cursorState, setCursorState] = useState<CursorState | null>(null)
+
+    // Layout state for scale support
+    const [layoutState, setLayoutState] = useState<LayoutState>({
+        scale: DEFAULT_SCALE,
+        containerPadding: 20, // matches CSS .canvas-container padding
+    })
+
+    // Cursor offset in textarea
+    const cursorOffsetRef = useRef<number>(0)
+
     // Refs
     const workerRef = useRef<Worker | null>(null)
     const rendererRef = useRef<TypstRenderer | null>(null)
     const canvasContainerRef = useRef<HTMLDivElement>(null)
+    const typstMountRef = useRef<HTMLDivElement>(null) // Dedicated mount point for Typst
     const requestIdRef = useRef<number>(0)
     const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
     const latestArtifactRef = useRef<Uint8Array | null>(null)
-    const isRenderingRef = useRef<boolean>(false)
+
+    // Render Queue for strict serialization (prevents Rust aliasing panic)
+    const renderQueueRef = useRef(new RenderQueue())
 
     // EditorState (headless) - kept for future use
     const editorStateRef = useRef<EditorState>(EditorState.create({ schema }))
@@ -86,6 +249,25 @@ export function MonolithEditor() {
     // ============================================================================
     // Initialize Worker and Renderer
     // ============================================================================
+
+    // Initialize renderer helper
+    const initRenderer = useCallback(async () => {
+        try {
+            const renderer = createTypstRenderer()
+            await renderer.init({
+                getModule: () => new URL(
+                    '@myriaddreamin/typst-ts-renderer/pkg/typst_ts_renderer_bg.wasm',
+                    import.meta.url
+                ).href
+            })
+            rendererRef.current = renderer
+            console.log('[MonolithEditor] Renderer initialized')
+            return true
+        } catch (e) {
+            console.error('[MonolithEditor] Failed to init renderer:', e)
+            return false
+        }
+    }, [])
 
     useEffect(() => {
         let mounted = true
@@ -111,15 +293,7 @@ export function MonolithEditor() {
                 }
 
                 // Initialize renderer
-                const renderer = createTypstRenderer()
-                await renderer.init({
-                    getModule: () => new URL(
-                        '@myriaddreamin/typst-ts-renderer/pkg/typst_ts_renderer_bg.wasm',
-                        import.meta.url
-                    ).href
-                })
-                rendererRef.current = renderer
-                console.log('[MonolithEditor] Renderer ready')
+                await initRenderer()
 
                 // Initialize compiler
                 worker.postMessage({ kind: 'INIT' })
@@ -132,12 +306,11 @@ export function MonolithEditor() {
         }
 
         init()
-
         return () => {
             mounted = false
             workerRef.current?.terminate()
         }
-    }, [])
+    }, [initRenderer])
 
     // ============================================================================
     // Worker Message Handler
@@ -156,16 +329,23 @@ export function MonolithEditor() {
                 const artifact = msg.artifact as Uint8Array
                 const timing = msg.timing as number
                 const probeCount = msg.probeCount as number
-                const probes = msg.probes as Array<{ id: string; location: { page: number; x: number; y: number } }>
+                const probes = msg.probes as Array<{ id: string; payload?: { kind?: string }; location: { page: number; x: number; y: number } }>
 
                 console.log(`[MonolithEditor] Compile success: ${timing.toFixed(0)}ms, ${probeCount} probes`)
 
-                // Log probe data for debugging
-                if (probes && probes.length > 0) {
-                    console.log('[MonolithEditor] Probes extracted:')
-                    probes.forEach((probe, i) => {
-                        console.log(`  [${i}] ${probe.id}: page=${probe.location?.page}, x=${probe.location?.x?.toFixed(1)}, y=${probe.location?.y?.toFixed(1)}`)
+                // Find cursor probe and update position (store raw pt coords)
+                const cursorProbe = probes?.find(p => p.id === 'cursor' || p.payload?.kind === 'cursor')
+                if (cursorProbe?.location) {
+                    // Store RAW coordinates in points - scaling applied in PhantomCursor
+                    setCursorState({
+                        x: cursorProbe.location.x,
+                        y: cursorProbe.location.y,
+                        height: 12, // Default cursor height in pt
+                        pageIndex: cursorProbe.location.page,
                     })
+                    console.log(`[MonolithEditor] Cursor at: (${cursorProbe.location.x.toFixed(1)}, ${cursorProbe.location.y.toFixed(1)}) pt`)
+                } else {
+                    setCursorState(null)
                 }
 
                 setStats({
@@ -206,10 +386,11 @@ export function MonolithEditor() {
 
         setStatus('compiling')
 
-        // Serialize to Typst with probes
+        // Serialize to Typst with probes, including cursor probe
         const typstSource = serializePlainText(text, {
             injectProbes: true,
             probeLibPath: '/lib/probe.typ',
+            cursorOffset: cursorOffsetRef.current,
         })
 
         console.log('[MonolithEditor] Generated Typst source:\n', typstSource)
@@ -230,7 +411,10 @@ export function MonolithEditor() {
 
     const handleInputChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
         const text = e.target.value
+        const cursorOffset = e.target.selectionStart ?? 0
+
         setInputText(text)
+        cursorOffsetRef.current = cursorOffset
 
         // Update ProseMirror state (headless)
         const newDoc = schema.node('doc', null, [
@@ -238,65 +422,129 @@ export function MonolithEditor() {
         ])
         editorStateRef.current = EditorState.create({ schema, doc: newDoc })
 
-        // Debounce compilation
+        // Debounce compilation (200ms to reduce Rust aliasing panics)
         if (debounceRef.current) {
             clearTimeout(debounceRef.current)
         }
 
         debounceRef.current = setTimeout(() => {
             triggerCompile(text)
-        }, 300)
+        }, 16)
     }, [triggerCompile])
+
+    // Track cursor position changes (click, arrow keys, etc.)
+    const handleSelect = useCallback((e: React.SyntheticEvent<HTMLTextAreaElement>) => {
+        const target = e.target as HTMLTextAreaElement
+        cursorOffsetRef.current = target.selectionStart ?? 0
+
+        // Trigger recompile to update cursor position
+        if (debounceRef.current) {
+            clearTimeout(debounceRef.current)
+        }
+        debounceRef.current = setTimeout(() => {
+            triggerCompile(inputText)
+        }, 16)
+    }, [inputText, triggerCompile])
 
     // ============================================================================
     // Canvas Rendering
     // ============================================================================
 
-    const renderArtifact = useCallback(async (artifact: Uint8Array) => {
-        // [FIX] Queued rendering: if busy, save artifact and render after current completes
-        if (isRenderingRef.current) {
-            // Save this as the pending artifact - only keep the latest
-            latestArtifactRef.current = artifact
-            console.log('[MonolithEditor] Render busy, queued latest artifact')
-            return
-        }
+    const renderArtifact = useCallback((artifact: Uint8Array) => {
+        // Use RenderQueue to strictly serialize render calls
+        renderQueueRef.current.enqueue(async () => {
+            const renderer = rendererRef.current
+            const mountPoint = typstMountRef.current
 
-        const renderer = rendererRef.current
-        const container = canvasContainerRef.current
+            if (!renderer || !mountPoint) {
+                console.warn('[MonolithEditor] Renderer or mount point not ready')
+                return
+            }
 
-        if (!renderer || !container) {
-            console.warn('[MonolithEditor] Renderer or container not ready')
-            return
-        }
+            // Render the artifact
+            console.log(`[MonolithEditor] Rendering artifact (${artifact.byteLength} bytes) to mount point...`)
+            try {
+                await renderer.renderToCanvas({
+                    container: mountPoint,
+                    artifactContent: artifact,
+                    format: 'vector',
+                    pixelPerPt: PIXEL_PER_PT,
+                    backgroundColor: '#ffffff',
+                })
+            } catch (e) {
+                console.error('[MonolithEditor] renderToCanvas failed:', e)
 
-        try {
-            isRenderingRef.current = true // LOCK
+                // Auto-Recovery for critical WASM ownership errors
+                const errStr = String(e)
+                if (errStr.includes('attempted to take ownership') || errStr.includes('recursive use')) {
+                    console.warn('[MonolithEditor] Critical renderer error detected. Re-initializing renderer...')
+                    rendererRef.current = null // Prevent further use
+                    await initRenderer()
+                    console.log('[MonolithEditor] Renderer recovered. Skipping this frame.')
+                    return // Skip this frame
+                }
 
-            // Render the current artifact
-            await renderer.renderToCanvas({
-                container,
-                artifactContent: artifact,
-                format: 'vector',
-                pixelPerPt: 3, // High DPI for retina
-                backgroundColor: '#ffffff',
-            })
+                throw e // Re-throw other errors
+            }
 
-        } catch (e) {
-            console.error('[MonolithEditor] Render error:', e)
-        } finally {
-            // Add a small cooldown to let Rust WASM fully release resources
-            await new Promise(resolve => setTimeout(resolve, 50))
+            // Calculate scale after render (CSS fit-to-width)
+            const canvas = mountPoint.querySelector('canvas')
+            if (canvas) {
+                const rect = canvas.getBoundingClientRect()
+                console.log(`[MonolithEditor] Render check - Canvas: Intrinsic=${canvas.width}x${canvas.height}, Display=${rect.width}x${rect.height}`)
 
-            isRenderingRef.current = false // UNLOCK
+                // Effective scale = Rendered Width (px) / Intrinsic Width (px)
+                // Intrinsic width is set by canvas.width (which is scaled by pixelRatio in typst.ts, or just width * pixelPerPt)
+                // Actually typst.ts sets width/height attributes based on pixelPerPt.
 
-            // Check if there's a pending artifact to render
-            const pending = latestArtifactRef.current
-            if (pending && pending !== artifact) {
-                latestArtifactRef.current = null
-                // Use setTimeout for async isolation  
-                setTimeout(() => renderArtifact(pending), 0)
+                // Effective scale = Rendered Width (px) / Intrinsic Width (px)
+                // Intrinsic Width = Width (pt) * PIXEL_PER_PT
+
+                // Wait a tick for layout to settle? Usually sync after renderToCanvas is fine if DOM is updated.
+                // However, let's measuring the ratio directly:
+                const renderedScale = rect.width / canvas.width
+
+                // The 'scale' in our formula earlier was meant to be the zoom level relative to 'intrinsic'.
+                // If canvas.width is 3000px (1000pt * 3), and it renders at 1000px width.
+                // renderedScale = 0.333.
+                // Pos (pt) = 500pt.
+                // Visual Pos (px) = 500 * 3 * 0.333 = 500px. Correct.
+
+                console.log(`[MonolithEditor] Scale updated: ${renderedScale.toFixed(4)} (Rendered: ${rect.width}px / Intrinsic: ${canvas.width}px)`)
+
+                // Update layout state
+                setLayoutState((prev: LayoutState) => {
+                    if (Math.abs(prev.scale - renderedScale) > 0.001) {
+                        return { ...prev, scale: renderedScale }
+                    }
+                    return prev
+                })
+            }
+        })
+    }, [])
+
+    // Update scale on window resize
+    useEffect(() => {
+        const handleResize = () => {
+            const mountPoint = typstMountRef.current
+            const canvas = mountPoint?.querySelector('canvas')
+            if (canvas) {
+                const rect = canvas.getBoundingClientRect()
+                const newScale = rect.width / canvas.width
+
+                // Only update if changed significantly
+                setLayoutState((prev: LayoutState) => {
+                    if (Math.abs(prev.scale - newScale) > 0.001) {
+                        console.log(`[MonolithEditor] Resize scale: ${newScale.toFixed(4)}`)
+                        return { ...prev, scale: newScale }
+                    }
+                    return prev
+                })
             }
         }
+
+        window.addEventListener('resize', handleResize)
+        return () => window.removeEventListener('resize', handleResize)
     }, [])
 
     // ============================================================================
@@ -320,6 +568,9 @@ export function MonolithEditor() {
                     <textarea
                         value={inputText}
                         onChange={handleInputChange}
+                        onSelect={handleSelect}
+                        onClick={handleSelect}
+                        onKeyUp={handleSelect}
                         placeholder="Type here... Use $...$ for math equations"
                         disabled={status === 'initializing'}
                     />
@@ -360,6 +611,16 @@ export function MonolithEditor() {
                     {status === 'initializing' && (
                         <div className="loading-overlay">Initializing Typst Engine</div>
                     )}
+
+                    {/* Typst Render Layer (Isolated) */}
+                    <div className="typst-mount-point" ref={typstMountRef} />
+
+                    {/* Cursor Layer (Isolated) */}
+                    <PhantomCursor
+                        cursorState={cursorState}
+                        layoutState={layoutState}
+                        containerRef={canvasContainerRef}
+                    />
                 </div>
             </div>
         </div>

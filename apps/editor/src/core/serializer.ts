@@ -15,11 +15,14 @@ export interface SerializerConfig {
     injectProbes: boolean
     /** The probe library import path */
     probeLibPath: string
+    /** Character offset for cursor probe injection (null = no cursor probe) */
+    cursorOffset?: number | null
 }
 
 const DEFAULT_CONFIG: SerializerConfig = {
     injectProbes: true,
     probeLibPath: '/lib/probe.typ',
+    cursorOffset: null,
 }
 
 /**
@@ -263,6 +266,12 @@ export function serializePlainText(
 ): string {
     const cfg = { ...DEFAULT_CONFIG, ...config }
     const parts: string[] = []
+    const cursorOffset = cfg.cursorOffset ?? null
+
+    // Debug: Log cursor offset
+    if (cursorOffset !== null) {
+        console.log(`[Serializer] Cursor offset: ${cursorOffset}, text length: ${text.length}`)
+    }
 
     // Preamble
     parts.push(`// Monolith Editor - Generated Typst Document`)
@@ -273,8 +282,24 @@ export function serializePlainText(
         parts.push(``)
     }
 
-    // Split text into paragraphs
-    const paragraphs = text.split(/\n\n+/)
+    // Handle cursor injection at document level (simpler approach)
+    // Instead of splitting by paragraphs and losing track, inject cursor first
+    let processedText = text
+
+    if (cursorOffset !== null && cfg.injectProbes) {
+        // Find safe insertion point
+        const safeOffset = findSafeInsertionPoint(text, cursorOffset)
+
+        // Insert cursor probe directly into the text
+        const before = text.substring(0, safeOffset)
+        const after = text.substring(safeOffset)
+
+        processedText = before + '<<<CURSOR>>>' + after
+        console.log(`[Serializer] Injecting cursor at offset ${safeOffset}`)
+    }
+
+    // Now split into paragraphs and process
+    const paragraphs = processedText.split(/\n\n+/)
 
     paragraphs.forEach((para, index) => {
         const trimmed = para.trim()
@@ -282,8 +307,28 @@ export function serializePlainText(
 
         const id = `para-${index + 1}`
 
-        // Don't escape math content
-        const content = trimmed.includes('$') ? trimmed : escapeTypst(trimmed)
+        // Check if this paragraph contains the cursor marker
+        let content: string
+
+        if (trimmed.includes('<<<CURSOR>>>')) {
+            // Replace marker with actual cursor probe
+            const cursorProbe = '#probe("cursor", payload: (kind: "cursor"))'
+
+            // Split at cursor marker
+            const markerIndex = trimmed.indexOf('<<<CURSOR>>>')
+            const beforeCursor = trimmed.substring(0, markerIndex)
+            const afterCursor = trimmed.substring(markerIndex + '<<<CURSOR>>>'.length)
+
+            // Escape each part separately (but not math content)
+            const escapedBefore = beforeCursor.includes('$') ? beforeCursor : escapeTypst(beforeCursor)
+            const escapedAfter = afterCursor.includes('$') ? afterCursor : escapeTypst(afterCursor)
+
+            content = escapedBefore + cursorProbe + escapedAfter
+            console.log(`[Serializer] Cursor probe injected in paragraph ${index + 1}`)
+        } else {
+            // Normal paragraph - no cursor
+            content = trimmed.includes('$') ? trimmed : escapeTypst(trimmed)
+        }
 
         if (cfg.injectProbes) {
             parts.push(probeStart(id, 'paragraph') + content + probeEnd(id, 'paragraph'))
@@ -294,3 +339,41 @@ export function serializePlainText(
 
     return parts.join('\n\n')
 }
+
+
+
+
+/**
+ * Find a safe point to insert the cursor probe
+ * Avoids splitting inside: $...$ (math), *...* (bold), _..._ (italic)
+ */
+function findSafeInsertionPoint(text: string, desiredOffset: number): number {
+    // Check if we're inside a math expression
+    let inMath = false
+    let mathStart = -1
+
+    for (let i = 0; i < text.length; i++) {
+        if (text[i] === '$' && (i === 0 || text[i - 1] !== '\\')) {
+            if (inMath) {
+                // End of math - check if cursor is inside
+                if (desiredOffset > mathStart && desiredOffset <= i) {
+                    // Cursor is inside math, move to end of math
+                    return i + 1
+                }
+                inMath = false
+            } else {
+                // Start of math
+                inMath = true
+                mathStart = i
+            }
+        }
+    }
+
+    // If we're still in unclosed math, put cursor after the $
+    if (inMath && desiredOffset > mathStart) {
+        return mathStart
+    }
+
+    return desiredOffset
+}
+

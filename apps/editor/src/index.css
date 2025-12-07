@@ -124,8 +124,15 @@ body {
 }
 
 @keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.5; }
+
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.5;
+  }
 }
 
 .input-area {
@@ -168,6 +175,8 @@ body {
   padding: 20px;
   overflow: auto;
   box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+  position: relative;
+  /* Required for phantom cursor positioning */
 }
 
 .canvas-container canvas {
@@ -245,5 +254,28 @@ body {
 }
 
 @keyframes spin {
-  to { transform: rotate(360deg); }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ============================================================================
+   Phantom Cursor - The cursor rendered on Canvas that syncs with input
+   ============================================================================ */
+
+.phantom-cursor {
+  animation: blink 1s step-end infinite;
+  box-shadow: 0 0 4px rgba(0, 0, 0, 0.3);
+}
+
+@keyframes blink {
+
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0;
+  }
 }
