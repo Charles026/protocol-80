@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Shadow DOM Debug Overlay</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            padding: 20px;
+        }
+        h1 { color: #00d4ff; }
+        .page-container {
+            display: inline-block;
+            margin: 20px;
+            vertical-align: top;
+        }
+        .page-label {
+            text-align: center;
+            margin-bottom: 10px;
+            font-weight: bold;
+        }
+        .page {
+            width: 595px;
+            height: 842px;
+            background: white;
+            position: relative;
+            border: 2px solid #333;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+        }
+        .rect {
+            position: absolute;
+            border: 2px solid rgba(255, 50, 50, 0.8);
+            background: rgba(255, 50, 50, 0.15);
+            cursor: pointer;
+            transition: all 0.2s;
+            box-sizing: border-box;
+        }
+        .rect:hover {
+            background: rgba(255, 50, 50, 0.4);
+            border-color: #ff0000;
+            z-index: 100;
+        }
+        .rect .tooltip {
+            display: none;
+            position: absolute;
+            top: -30px;
+            left: 0;
+            background: #222;
+            color: #fff;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            white-space: nowrap;
+            z-index: 1000;
+        }
+        .rect:hover .tooltip {
+            display: block;
+        }
+        .legend {
+            margin-bottom: 20px;
+            padding: 15px;
+            background: #16213e;
+            border-radius: 8px;
+        }
+    </style>
+</head>
+<body>
+    <h1>🔍 Shadow DOM Debug Overlay</h1>
+    <div class="legend">
+        <strong>Legend:</strong> Red boxes = Probe regions | Hover for details | 
+        Total: 6 rects across 2 pages
+    </div>
+
+    <div class="page-container">
+        <div class="page-label">Page 1</div>
+        <div class="page">
+            <div class="rect" style="left:70.9px; top:70.9px; width:10.0px; height:10.0px;">
+                <span class="tooltip">[origin] origin-document</span>
+            </div>
+            <div class="rect" style="left:70.9px; top:84.1px; width:10.0px; height:10.0px;">
+                <span class="tooltip">[probe] test-1</span>
+            </div>
+            <div class="rect" style="left:70.9px; top:149.7px; width:400.0px; height:15.0px;">
+                <span class="tooltip">[probe] paragraph-1</span>
+            </div>
+            <div class="rect" style="left:70.9px; top:162.9px; width:400.0px; height:50.4px;">
+                <span class="tooltip">[section] section-introduction</span>
+            </div>
+        </div>
+    </div>
+    <div class="page-container">
+        <div class="page-label">Page 2</div>
+        <div class="page">
+            <div class="rect" style="left:70.9px; top:70.9px; width:10.0px; height:10.0px;">
+                <span class="tooltip">[probe] page-2-start</span>
+            </div>
+            <div class="rect" style="left:70.9px; top:129.3px; width:10.0px; height:10.0px;">
+                <span class="tooltip">[probe] document-end</span>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

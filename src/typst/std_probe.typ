@@ -348,6 +348,10 @@
 
 /// Emit all probe data as embedded metadata
 ///
+/// **DEPRECATED (Protocol 80 Phase 2)**: This function is no longer needed.
+/// The Worker now extracts probes directly via `compiler.query(<__monolith_probe>)`.
+/// Keeping for backward compatibility but will be removed in future versions.
+///
 /// Call this at the very end of your document to embed all probe data
 /// in a single queryable metadata block. This is the recommended approach
 /// for extracting probe data via the Wasm bridge.
