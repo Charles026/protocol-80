@@ -97,6 +97,10 @@ export class MonolithRenderManager {
                 this.pendingArtifact = null; // Clear pending, we are handling it now
 
                 try {
+                    if (container.hasChildNodes()) {
+                        container.innerHTML = '';
+                    }
+
                     await this.renderer!.renderToCanvas({
                         container,
                         artifactContent: artifactToRender,
