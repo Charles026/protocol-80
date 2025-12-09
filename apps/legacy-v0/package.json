@@ -1,0 +1,30 @@
+{
+  "name": "monolith-editor-legacy",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "eslint .",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@myriaddreamin/typst-ts-renderer": "0.6.1-rc5",
+    "@myriaddreamin/typst-ts-web-compiler": "0.6.1-rc5",
+    "@myriaddreamin/typst.react": "0.6.1-rc5",
+    "@myriaddreamin/typst.ts": "0.6.1-rc5",
+    "react": "^19.2.1",
+    "react-dom": "^19.2.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.1",
+    "eslint": "^9.39.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.6",
+    "vite-plugin-top-level-await": "^1.6.0",
+    "vite-plugin-wasm": "^3.5.0"
+  }
+}

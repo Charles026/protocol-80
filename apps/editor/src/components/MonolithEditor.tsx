@@ -8,9 +8,10 @@
 import { useState, useEffect, useRef, useCallback, useLayoutEffect } from 'react'
 import { Schema } from 'prosemirror-model'
 import { EditorState } from 'prosemirror-state'
-import { createTypstRenderer, type TypstRenderer } from '@myriaddreamin/typst.ts/renderer'
 import { serializePlainText } from '../core/serializer'
+import { MonolithRenderManager } from '../core/MonolithRenderManager'
 import TypstWorker from '../workers/typst.worker?worker'
+import { EDITOR_CONFIG } from '../config/editor'
 
 // ============================================================================
 // ProseMirror Schema
@@ -55,14 +56,11 @@ interface CompileStats {
 }
 
 // ============================================================================
-// Constants
+// Constants (extracted from EDITOR_CONFIG for local use)
 // ============================================================================
 
-/** Pixels per point - must match renderToCanvas pixelPerPt value */
-const PIXEL_PER_PT = 3.0
-
-/** Default display scale factor (for now fixed, will be dynamic with zoom) */
-const DEFAULT_SCALE = 1.0
+// Note: All magic numbers are now centralized in EDITOR_CONFIG
+// These local references provide cleaner usage in the render code
 
 // ============================================================================
 // Types for Cursor and Layout
@@ -84,54 +82,6 @@ interface LayoutState {
     scale: number
     /** Canvas container padding in pixels */
     containerPadding: number
-}
-
-// ============================================================================
-// Render Queue - Strictly serializes render calls to prevent Rust aliasing
-// ============================================================================
-
-class RenderQueue {
-    private isBusy: boolean = false
-    private pendingTask: (() => Promise<void>) | null = null
-
-    enqueue(task: () => Promise<void>): void {
-        // If busy, overwrite pending task (conflation/frame skipping)
-        if (this.isBusy) {
-            this.pendingTask = task
-            return
-        }
-
-        // Otherwise start immediately
-        this.process(task)
-    }
-
-    private async process(task: () => Promise<void>) {
-        // console.log('[RenderQueue] Processing task...')
-        this.isBusy = true
-
-        try {
-            await task()
-            // console.log('[RenderQueue] Task finished')
-        } catch (err) {
-            console.warn('[RenderQueue] Task failed:', err)
-            // Extra cooldown on error to let system settle
-            await new Promise(resolve => setTimeout(resolve, 50))
-        } finally {
-            // Unlock on next animation frame for max smoothness
-            requestAnimationFrame(() => {
-                this.isBusy = false
-
-                if (this.pendingTask) {
-                    // console.log('[RenderQueue] Processing pending task...')
-                    const next = this.pendingTask
-                    this.pendingTask = null
-                    this.process(next)
-                } else {
-                    // console.log('[RenderQueue] Idle')
-                }
-            })
-        }
-    }
 }
 
 // ============================================================================
@@ -168,9 +118,9 @@ function PhantomCursor({ cursorState, layoutState }: PhantomCursorProps) {
         // Formula: Pos_cursor = (Pos_core × PIXEL_PER_PT × Scale) + Offset
         // PIXEL_PER_PT converts pt → px at 1:1 scale
         // scale applies the current zoom level
-        const visualX = x * PIXEL_PER_PT * scale
-        const visualY = y * PIXEL_PER_PT * scale
-        const visualHeight = height * PIXEL_PER_PT * scale
+        const visualX = x * EDITOR_CONFIG.PIXEL_PER_PT * scale
+        const visualY = y * EDITOR_CONFIG.PIXEL_PER_PT * scale
+        const visualHeight = height * EDITOR_CONFIG.PIXEL_PER_PT * scale
 
         // Add container padding offset
         const finalLeft = containerPadding + visualX
@@ -224,8 +174,8 @@ export function MonolithEditor() {
 
     // Layout state for scale support
     const [layoutState, setLayoutState] = useState<LayoutState>({
-        scale: DEFAULT_SCALE,
-        containerPadding: 20, // matches CSS .canvas-container padding
+        scale: EDITOR_CONFIG.DEFAULT_SCALE,
+        containerPadding: EDITOR_CONFIG.CANVAS_PADDING,
     })
 
     // Cursor offset in textarea
@@ -233,148 +183,22 @@ export function MonolithEditor() {
 
     // Refs
     const workerRef = useRef<Worker | null>(null)
-    const rendererRef = useRef<TypstRenderer | null>(null)
     const canvasContainerRef = useRef<HTMLDivElement>(null)
     const typstMountRef = useRef<HTMLDivElement>(null) // Dedicated mount point for Typst
     const requestIdRef = useRef<number>(0)
     const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
     const latestArtifactRef = useRef<Uint8Array | null>(null)
 
-    // Render Queue for strict serialization (prevents Rust aliasing panic)
-    const renderQueueRef = useRef(new RenderQueue())
+    // Strict render loop state (latest-only, serialized)
+    const isRenderingRef = useRef(false)
 
     // EditorState (headless) - kept for future use
     const editorStateRef = useRef<EditorState>(EditorState.create({ schema }))
 
-    // ============================================================================
-    // Initialize Worker and Renderer
-    // ============================================================================
+    // Refs for stable callbacks (avoid useEffect dependency churn)
+    const inputTextRef = useRef(inputText)
+    inputTextRef.current = inputText
 
-    // Initialize renderer helper
-    const initRenderer = useCallback(async () => {
-        try {
-            const renderer = createTypstRenderer()
-            await renderer.init({
-                getModule: () => new URL(
-                    '@myriaddreamin/typst-ts-renderer/pkg/typst_ts_renderer_bg.wasm',
-                    import.meta.url
-                ).href
-            })
-            rendererRef.current = renderer
-            console.log('[MonolithEditor] Renderer initialized')
-            return true
-        } catch (e) {
-            console.error('[MonolithEditor] Failed to init renderer:', e)
-            return false
-        }
-    }, [])
-
-    useEffect(() => {
-        let mounted = true
-
-        async function init() {
-            try {
-                console.log('[MonolithEditor] Initializing...')
-
-                // Create worker
-                const worker = new TypstWorker()
-                workerRef.current = worker
-
-                // Set up message handler
-                worker.onmessage = (event: MessageEvent) => {
-                    if (!mounted) return
-                    handleWorkerMessage(event.data)
-                }
-
-                worker.onerror = (err) => {
-                    console.error('[MonolithEditor] Worker error:', err)
-                    setStatus('error')
-                    setError('Worker crashed')
-                }
-
-                // Initialize renderer
-                await initRenderer()
-
-                // Initialize compiler
-                worker.postMessage({ kind: 'INIT' })
-
-            } catch (e) {
-                console.error('[MonolithEditor] Init error:', e)
-                setStatus('error')
-                setError(e instanceof Error ? e.message : String(e))
-            }
-        }
-
-        init()
-        return () => {
-            mounted = false
-            workerRef.current?.terminate()
-        }
-    }, [initRenderer])
-
-    // ============================================================================
-    // Worker Message Handler
-    // ============================================================================
-
-    const handleWorkerMessage = useCallback((msg: { kind: string;[key: string]: unknown }) => {
-        switch (msg.kind) {
-            case 'READY':
-                console.log('[MonolithEditor] Worker ready, triggering initial compile')
-                setStatus('ready')
-                // Trigger initial compile
-                triggerCompile(inputText)
-                break
-
-            case 'COMPILE_SUCCESS': {
-                const artifact = msg.artifact as Uint8Array
-                const timing = msg.timing as number
-                const probeCount = msg.probeCount as number
-                const probes = msg.probes as Array<{ id: string; payload?: { kind?: string }; location: { page: number; x: number; y: number } }>
-
-                console.log(`[MonolithEditor] Compile success: ${timing.toFixed(0)}ms, ${probeCount} probes`)
-
-                // Find cursor probe and update position (store raw pt coords)
-                const cursorProbe = probes?.find(p => p.id === 'cursor' || p.payload?.kind === 'cursor')
-                if (cursorProbe?.location) {
-                    // Store RAW coordinates in points - scaling applied in PhantomCursor
-                    setCursorState({
-                        x: cursorProbe.location.x,
-                        y: cursorProbe.location.y,
-                        height: 12, // Default cursor height in pt
-                        pageIndex: cursorProbe.location.page,
-                    })
-                    console.log(`[MonolithEditor] Cursor at: (${cursorProbe.location.x.toFixed(1)}, ${cursorProbe.location.y.toFixed(1)}) pt`)
-                } else {
-                    setCursorState(null)
-                }
-
-                setStats({
-                    lastCompileTime: timing,
-                    probeCount,
-                    artifactSize: artifact.byteLength,
-                })
-
-                // Store artifact and render
-                latestArtifactRef.current = artifact
-                renderArtifact(artifact)
-                setStatus('ready')
-                setError(null)
-                break
-            }
-
-            case 'COMPILE_ERROR':
-                console.error('[MonolithEditor] Compile error:', msg.error)
-                setStatus('error')
-                setError(msg.error as string)
-                break
-
-            case 'PANIC':
-                console.error('[MonolithEditor] Worker panic:', msg.reason)
-                setStatus('error')
-                setError(`Worker panic: ${msg.reason}`)
-                break
-        }
-    }, [inputText])
 
     // ============================================================================
     // Compile Logic
@@ -382,7 +206,7 @@ export function MonolithEditor() {
 
     const triggerCompile = useCallback((text: string) => {
         const worker = workerRef.current
-        if (!worker || status === 'initializing') return
+        if (!worker) return
 
         setStatus('compiling')
 
@@ -403,7 +227,7 @@ export function MonolithEditor() {
             source: typstSource,
             mainFilePath: '/main.typ',
         })
-    }, [status])
+    }, [])
 
     // ============================================================================
     // Debounced Input Handler
@@ -429,7 +253,7 @@ export function MonolithEditor() {
 
         debounceRef.current = setTimeout(() => {
             triggerCompile(text)
-        }, 16)
+        }, EDITOR_CONFIG.INPUT_DEBOUNCE_MS)
     }, [triggerCompile])
 
     // Track cursor position changes (click, arrow keys, etc.)
@@ -443,85 +267,165 @@ export function MonolithEditor() {
         }
         debounceRef.current = setTimeout(() => {
             triggerCompile(inputText)
-        }, 16)
+        }, EDITOR_CONFIG.INPUT_DEBOUNCE_MS)
     }, [inputText, triggerCompile])
 
+
     // ============================================================================
-    // Canvas Rendering
+    // Initialize Worker and Renderer (runs once on mount)
     // ============================================================================
 
-    const renderArtifact = useCallback((artifact: Uint8Array) => {
-        // Use RenderQueue to strictly serialize render calls
-        renderQueueRef.current.enqueue(async () => {
-            const renderer = rendererRef.current
-            const mountPoint = typstMountRef.current
+    useEffect(() => {
+        let mounted = true
 
-            if (!renderer || !mountPoint) {
-                console.warn('[MonolithEditor] Renderer or mount point not ready')
-                return
-            }
-
-            // Render the artifact
-            console.log(`[MonolithEditor] Rendering artifact (${artifact.byteLength} bytes) to mount point...`)
+        async function init() {
             try {
-                await renderer.renderToCanvas({
-                    container: mountPoint,
-                    artifactContent: artifact,
-                    format: 'vector',
-                    pixelPerPt: PIXEL_PER_PT,
-                    backgroundColor: '#ffffff',
-                })
-            } catch (e) {
-                console.error('[MonolithEditor] renderToCanvas failed:', e)
+                // Singleton Init (protects against strict mode double-init internally)
+                const renderManager = MonolithRenderManager.getInstance()
+                await renderManager.init()
 
-                // Auto-Recovery for critical WASM ownership errors
-                const errStr = String(e)
-                if (errStr.includes('attempted to take ownership') || errStr.includes('recursive use')) {
-                    console.warn('[MonolithEditor] Critical renderer error detected. Re-initializing renderer...')
-                    rendererRef.current = null // Prevent further use
-                    await initRenderer()
-                    console.log('[MonolithEditor] Renderer recovered. Skipping this frame.')
-                    return // Skip this frame
+                if (!mounted) return
+
+                // We no longer need local rendererRef for rendering, 
+                // but if other parts use it, we might need to expose it from manager.
+                // However, current code uses manager for scheduling.
+
+                console.log('[MonolithEditor] Renderer initialized (Singleton)')
+
+                // 2. Create worker
+                const worker = new TypstWorker()
+                workerRef.current = worker
+
+                // 3. Set up message handler (uses refs for stable access to current state)
+                worker.onmessage = (event: MessageEvent) => {
+                    if (!mounted) return
+                    const msg = event.data as { kind: string;[key: string]: unknown }
+
+                    switch (msg.kind) {
+                        case 'READY': {
+                            console.log('[MonolithEditor] Worker ready, triggering initial compile')
+                            setStatus('ready')
+
+                            // Trigger initial compile using ref for current inputText
+                            const text = inputTextRef.current
+                            const typstSource = serializePlainText(text, {
+                                injectProbes: true,
+                                probeLibPath: '/lib/probe.typ',
+                                cursorOffset: cursorOffsetRef.current,
+                            })
+                            console.log('[MonolithEditor] Generated Typst source:\n', typstSource)
+                            requestIdRef.current++
+                            worker.postMessage({
+                                kind: 'COMPILE',
+                                requestId: `req-${requestIdRef.current}`,
+                                source: typstSource,
+                                mainFilePath: '/main.typ',
+                            })
+                            break
+                        }
+
+                        case 'COMPILE_SUCCESS': {
+                            const artifact = msg.artifact as Uint8Array
+                            const timing = msg.timing as number
+                            const probeCount = msg.probeCount as number
+                            const probes = msg.probes as Array<{ id: string; payload?: { kind?: string }; location: { page: number; x: number; y: number } }>
+
+                            console.log(`[MonolithEditor] Compile success: ${timing.toFixed(0)}ms, ${probeCount} probes`)
+
+                            // Find cursor probe and update position
+                            const cursorProbe = probes?.find(p => p.id === 'cursor' || p.payload?.kind === 'cursor')
+                            if (cursorProbe?.location) {
+                                setCursorState({
+                                    x: cursorProbe.location.x,
+                                    y: cursorProbe.location.y,
+                                    height: EDITOR_CONFIG.CURSOR_HEIGHT_PT,
+                                    pageIndex: cursorProbe.location.page,
+                                })
+                            } else {
+                                setCursorState(null)
+                            }
+
+                            setStats({
+                                lastCompileTime: timing,
+                                probeCount,
+                                artifactSize: artifact.byteLength,
+                            })
+
+                            // Schedule render via Singleton Manager
+                            if (typstMountRef.current) {
+                                MonolithRenderManager.getInstance().scheduleRender(new Uint8Array(artifact), typstMountRef.current)
+                                    .then(() => {
+                                        // Update scale after render
+                                        const canvas = typstMountRef.current?.querySelector('canvas')
+                                        if (canvas) {
+                                            const rect = canvas.getBoundingClientRect()
+                                            const renderedScale = rect.width / canvas.width
+                                            setLayoutState(prev => {
+                                                if (Math.abs(prev.scale - renderedScale) > 0.001) {
+                                                    return { ...prev, scale: renderedScale }
+                                                }
+                                                return prev
+                                            })
+                                        }
+                                    })
+                            }
+
+                            setStatus('ready')
+                            setError(null)
+                            break
+                        }
+
+                        case 'COMPILE_ERROR':
+                            console.error('[MonolithEditor] Compile error:', msg.error)
+                            setStatus('error')
+                            setError(msg.error as string)
+                            break
+
+                        case 'PANIC':
+                            console.error('[MonolithEditor] Worker panic:', msg.reason)
+                            setStatus('error')
+                            setError(`Worker panic: ${msg.reason}`)
+                            break
+                    }
                 }
 
-                throw e // Re-throw other errors
+                worker.onerror = (err) => {
+                    console.error('[MonolithEditor] Worker error:', err)
+                    setStatus('error')
+                    setError('Worker crashed')
+                }
+
+                // 4. Initialize compiler in worker
+                worker.postMessage({ kind: 'INIT' })
+            } catch (e) {
+                console.error('[MonolithEditor] Init error:', e)
+                setStatus('error')
+                setError(e instanceof Error ? e.message : String(e))
+                // initMutex.current = false // Reset mutex on failure -> Removed for Singleton
             }
+        }
 
-            // Calculate scale after render (CSS fit-to-width)
-            const canvas = mountPoint.querySelector('canvas')
-            if (canvas) {
-                const rect = canvas.getBoundingClientRect()
-                console.log(`[MonolithEditor] Render check - Canvas: Intrinsic=${canvas.width}x${canvas.height}, Display=${rect.width}x${rect.height}`)
+        void init()
+        return () => {
+            mounted = false
+            workerRef.current?.terminate()
+            workerRef.current = null
+            latestArtifactRef.current = null
+            isRenderingRef.current = false
+            // Note: We don't reset initMutex.current immediately because strict mode 
+            // mounts/unmounts rapidly. We want to preserve the 'initialized' state
+            // or we'd need a more complex singleton pattern.
+            // But for now, ensuring we don't start the second init is key.
+            // Actually, if we unmount, we SHOULD verify if we need to let it re-init.
+            // But strict mode re-uses the component state? No, useEffect runs twice.
+            // If we terminate on Unmount1, and block Init2, we have nothing.
+            // FIX: We must allow re-init IF we fully cleaned up, OR we persist the worker.
+            // Since we terminate worker, we MUST re-init.
 
-                // Effective scale = Rendered Width (px) / Intrinsic Width (px)
-                // Intrinsic width is set by canvas.width (which is scaled by pixelRatio in typst.ts, or just width * pixelPerPt)
-                // Actually typst.ts sets width/height attributes based on pixelPerPt.
-
-                // Effective scale = Rendered Width (px) / Intrinsic Width (px)
-                // Intrinsic Width = Width (pt) * PIXEL_PER_PT
-
-                // Wait a tick for layout to settle? Usually sync after renderToCanvas is fine if DOM is updated.
-                // However, let's measuring the ratio directly:
-                const renderedScale = rect.width / canvas.width
-
-                // The 'scale' in our formula earlier was meant to be the zoom level relative to 'intrinsic'.
-                // If canvas.width is 3000px (1000pt * 3), and it renders at 1000px width.
-                // renderedScale = 0.333.
-                // Pos (pt) = 500pt.
-                // Visual Pos (px) = 500 * 3 * 0.333 = 500px. Correct.
-
-                console.log(`[MonolithEditor] Scale updated: ${renderedScale.toFixed(4)} (Rendered: ${rect.width}px / Intrinsic: ${canvas.width}px)`)
-
-                // Update layout state
-                setLayoutState((prev: LayoutState) => {
-                    if (Math.abs(prev.scale - renderedScale) > 0.001) {
-                        return { ...prev, scale: renderedScale }
-                    }
-                    return prev
-                })
-            }
-        })
-    }, [])
+            // Removed initMutex reset
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []) // Empty deps - init runs once on mount
 
     // Update scale on window resize
     useEffect(() => {

@@ -12,6 +12,7 @@
         "@myriaddreamin/typst-ts-renderer": "0.6.1-rc5",
         "@myriaddreamin/typst-ts-web-compiler": "0.6.1-rc5",
         "@myriaddreamin/typst.ts": "0.6.1-rc5",
+        "async-mutex": "^0.5.0",
         "prosemirror-model": "^1.25.1",
         "prosemirror-state": "^1.4.3",
         "prosemirror-view": "^1.38.1",
