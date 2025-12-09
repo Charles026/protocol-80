@@ -229,7 +229,7 @@ async function initCompiler(): Promise<void> {
                     assets: ['text'], // pulls text + math fonts from CDN
                 }),
             ],
-            getModule: () => getWasmModuleUrl(),
+            getModule: () => ({ module_or_path: getWasmModuleUrl() } as any),
         })
 
         isInitializing = false

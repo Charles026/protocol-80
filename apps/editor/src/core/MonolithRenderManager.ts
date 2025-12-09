@@ -53,10 +53,12 @@ export class MonolithRenderManager {
 
             const renderer = createTypstRenderer();
             await renderer.init({
-                getModule: () => new URL(
-                    '@myriaddreamin/typst-ts-renderer/pkg/typst_ts_renderer_bg.wasm',
-                    import.meta.url
-                ).href
+                getModule: () => ({
+                    module_or_path: new URL(
+                        '@myriaddreamin/typst-ts-renderer/pkg/typst_ts_renderer_bg.wasm',
+                        import.meta.url
+                    ).href
+                } as any)
             });
 
             this.renderer = renderer;

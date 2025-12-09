@@ -103,7 +103,7 @@ async function initCompiler(): Promise<void> {
           assets: ['text'], // Load LibertinusSerif + NewCM math from CDN
         }),
       ],
-      getModule: () => getWasmModuleUrl(),
+      getModule: () => ({ module_or_path: getWasmModuleUrl() } as any),
     })
 
     isInitializing = false
