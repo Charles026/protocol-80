@@ -97,6 +97,16 @@ export class MonolithRenderManager {
                 this.pendingArtifact = null; // Clear pending, we are handling it now
 
                 try {
+                    const hasSingleCanvas =
+                        container.childElementCount === 1 &&
+                        container.firstElementChild?.tagName === 'CANVAS';
+
+                    if (!hasSingleCanvas && container.hasChildNodes()) {
+                        while (container.firstChild) {
+                            container.removeChild(container.firstChild);
+                        }
+                    }
+
                     await this.renderer!.renderToCanvas({
                         container,
                         artifactContent: artifactToRender,
